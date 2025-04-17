@@ -41,6 +41,8 @@ impl VectorFunction {
         // conversion
         registry.register(Arc::new(convert::ParseVectorFunction));
         registry.register(Arc::new(convert::VectorToStringFunction));
+        registry.register(Arc::new(convert::VectorToJsonFunction));
+        registry.register(Arc::new(convert::JsonToVectorFunction));
 
         // distance
         registry.register(Arc::new(distance::CosDistanceFunction));

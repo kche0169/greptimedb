@@ -14,6 +14,10 @@
 
 mod parse_vector;
 mod vector_to_string;
+mod vector_to_json;
+mod json_to_vector;
 
 pub use parse_vector::ParseVectorFunction;
 pub use vector_to_string::VectorToStringFunction;
+pub use vector_to_json::VectorToJsonFunction;
+pub use json_to_vector::JsonToVectorFunction;
