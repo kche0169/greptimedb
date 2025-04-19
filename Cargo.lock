@@ -2315,6 +2315,7 @@ dependencies = [
  "datatypes",
  "futures",
  "pin-project",
+ "regex",
  "serde",
  "serde_json",
  "snafu 0.8.5",
@@ -4726,7 +4727,7 @@ dependencies = [
 [[package]]
 name = "greptime-proto"
 version = "0.1.0"
-source = "git+https://github.com/GreptimeTeam/greptime-proto.git?rev=583daa3fbbbe39c90b7b92d13646bc3291d9c941#583daa3fbbbe39c90b7b92d13646bc3291d9c941"
+source = "git+https://github.com/GreptimeTeam/greptime-proto.git?rev=b6d9cffd43c4e6358805a798f17e03e232994b82#b6d9cffd43c4e6358805a798f17e03e232994b82"
 dependencies = [
  "prost 0.13.5",
  "serde",
@@ -6415,6 +6416,7 @@ dependencies = [
  "common-test-util",
  "common-time",
  "common-wal",
+ "dashmap",
  "delta-encoding",
  "derive_builder 0.20.1",
  "futures",
@@ -8891,9 +8893,9 @@ dependencies = [
 
 [[package]]
 name = "promql-parser"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c6b1429bdd199d53bd58b745075c1652efedbe2746e5d4f0d56d3184dda48ec"
+checksum = "60d851f6523a8215e2fbf86b6cef4548433f8b76092e9ffb607105de52ae63fd"
 dependencies = [
  "cfgrammar",
  "chrono",
