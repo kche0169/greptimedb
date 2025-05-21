@@ -26,6 +26,7 @@ use common_catalog::consts::{is_readonly_schema, DEFAULT_CATALOG_NAME, DEFAULT_S
 use common_catalog::{format_full_flow_name, format_full_table_name};
 use common_error::ext::BoxedError;
 use common_meta::cache_invalidator::Context;
+use common_meta::ddl::create_flow::FlowType;
 use common_meta::ddl::ExecutorContext;
 use common_meta::instruction::CacheIdent;
 use common_meta::key::schema_name::{SchemaName, SchemaNameKey};
@@ -36,8 +37,10 @@ use common_meta::rpc::ddl::{
 };
 use common_meta::rpc::router::{Partition, Partition as MetaPartition};
 use common_query::Output;
-use common_telemetry::{debug, info, tracing};
+use common_telemetry::{debug, info, tracing, warn};
 use common_time::Timezone;
+use datafusion_common::tree_node::TreeNodeVisitor;
+use datafusion_expr::LogicalPlan;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::{RawSchema, Schema};
 use datatypes::value::Value;
@@ -45,7 +48,7 @@ use lazy_static::lazy_static;
 use partition::expr::{Operand, PartitionExpr, RestrictedOp};
 use partition::multi_dim::MultiDimPartitionRule;
 use partition::partition::{PartitionBound, PartitionDef};
-use query::parser::QueryStatement;
+use query::parser::{QueryLanguageParser, QueryStatement};
 use query::plan::extract_and_rewrite_full_table_names;
 use query::query_engine::DefaultSerializer;
 use query::sql::create_table_stmt;
@@ -69,13 +72,14 @@ use table::table_name::TableName;
 use table::TableRef;
 
 use crate::error::{
-    self, AlterExprToRequestSnafu, CatalogSnafu, ColumnDataTypeSnafu, ColumnNotFoundSnafu,
-    ConvertSchemaSnafu, CreateLogicalTablesSnafu, CreateTableInfoSnafu, DeserializePartitionSnafu,
-    EmptyDdlExprSnafu, ExtractTableNamesSnafu, FlowNotFoundSnafu, InvalidPartitionRuleSnafu,
-    InvalidPartitionSnafu, InvalidSqlSnafu, InvalidTableNameSnafu, InvalidViewNameSnafu,
-    InvalidViewStmtSnafu, ParseSqlValueSnafu, Result, SchemaInUseSnafu, SchemaNotFoundSnafu,
-    SchemaReadOnlySnafu, SubstraitCodecSnafu, TableAlreadyExistsSnafu, TableMetadataManagerSnafu,
-    TableNotFoundSnafu, UnrecognizedTableOptionSnafu, ViewAlreadyExistsSnafu,
+    self, AlterExprToRequestSnafu, BuildDfLogicalPlanSnafu, CatalogSnafu, ColumnDataTypeSnafu,
+    ColumnNotFoundSnafu, ConvertSchemaSnafu, CreateLogicalTablesSnafu, CreateTableInfoSnafu,
+    DeserializePartitionSnafu, EmptyDdlExprSnafu, ExternalSnafu, ExtractTableNamesSnafu,
+    FlowNotFoundSnafu, InvalidPartitionRuleSnafu, InvalidPartitionSnafu, InvalidSqlSnafu,
+    InvalidTableNameSnafu, InvalidViewNameSnafu, InvalidViewStmtSnafu, ParseSqlValueSnafu, Result,
+    SchemaInUseSnafu, SchemaNotFoundSnafu, SchemaReadOnlySnafu, SubstraitCodecSnafu,
+    TableAlreadyExistsSnafu, TableMetadataManagerSnafu, TableNotFoundSnafu,
+    UnrecognizedTableOptionSnafu, ViewAlreadyExistsSnafu,
 };
 use crate::expr_helper;
 use crate::statement::show::create_partitions_stmt;
@@ -181,7 +185,7 @@ impl StatementExecutor {
                 .contains_key(LOGICAL_TABLE_METADATA_KEY)
         {
             return self
-                .create_logical_tables(&[create_table.clone()], query_ctx)
+                .create_logical_tables(std::slice::from_ref(create_table), query_ctx)
                 .await?
                 .into_iter()
                 .next()
@@ -364,6 +368,18 @@ impl StatementExecutor {
         expr: CreateFlowExpr,
         query_context: QueryContextRef,
     ) -> Result<SubmitDdlTaskResponse> {
+        let flow_type = self
+            .determine_flow_type(&expr, query_context.clone())
+            .await?;
+        info!("determined flow={} type: {:#?}", expr.flow_name, flow_type);
+
+        let expr = {
+            let mut expr = expr;
+            expr.flow_options
+                .insert(FlowType::FLOW_TYPE_KEY.to_string(), flow_type.to_string());
+            expr
+        };
+
         let task = CreateFlowTask::try_from(PbCreateFlowTask {
             create_flow: Some(expr),
         })
@@ -377,6 +393,95 @@ impl StatementExecutor {
             .submit_ddl_task(&ExecutorContext::default(), request)
             .await
             .context(error::ExecuteDdlSnafu)
+    }
+
+    /// Determine the flow type based on the SQL query
+    ///
+    /// If it contains aggregation or distinct, then it is a batch flow, otherwise it is a streaming flow
+    async fn determine_flow_type(
+        &self,
+        expr: &CreateFlowExpr,
+        query_ctx: QueryContextRef,
+    ) -> Result<FlowType> {
+        // first check if source table's ttl is instant, if it is, force streaming mode
+        for src_table_name in &expr.source_table_names {
+            let table = self
+                .catalog_manager()
+                .table(
+                    &src_table_name.catalog_name,
+                    &src_table_name.schema_name,
+                    &src_table_name.table_name,
+                    Some(&query_ctx),
+                )
+                .await
+                .map_err(BoxedError::new)
+                .context(ExternalSnafu)?
+                .with_context(|| TableNotFoundSnafu {
+                    table_name: format_full_table_name(
+                        &src_table_name.catalog_name,
+                        &src_table_name.schema_name,
+                        &src_table_name.table_name,
+                    ),
+                })?;
+
+            // instant source table can only be handled by streaming mode
+            if table.table_info().meta.options.ttl == Some(common_time::TimeToLive::Instant) {
+                warn!(
+                    "Source table `{}` for flow `{}`'s ttl=instant, fallback to streaming mode",
+                    format_full_table_name(
+                        &src_table_name.catalog_name,
+                        &src_table_name.schema_name,
+                        &src_table_name.table_name
+                    ),
+                    expr.flow_name
+                );
+                return Ok(FlowType::Streaming);
+            }
+        }
+
+        let engine = &self.query_engine;
+        let stmt = QueryLanguageParser::parse_sql(&expr.sql, &query_ctx)
+            .map_err(BoxedError::new)
+            .context(ExternalSnafu)?;
+        let plan = engine
+            .planner()
+            .plan(&stmt, query_ctx)
+            .await
+            .map_err(BoxedError::new)
+            .context(ExternalSnafu)?;
+
+        /// Visitor to find aggregation or distinct
+        struct FindAggr {
+            is_aggr: bool,
+        }
+
+        impl TreeNodeVisitor<'_> for FindAggr {
+            type Node = LogicalPlan;
+            fn f_down(
+                &mut self,
+                node: &Self::Node,
+            ) -> datafusion_common::Result<datafusion_common::tree_node::TreeNodeRecursion>
+            {
+                match node {
+                    LogicalPlan::Aggregate(_) | LogicalPlan::Distinct(_) => {
+                        self.is_aggr = true;
+                        return Ok(datafusion_common::tree_node::TreeNodeRecursion::Stop);
+                    }
+                    _ => (),
+                }
+                Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
+            }
+        }
+
+        let mut find_aggr = FindAggr { is_aggr: false };
+
+        plan.visit_with_subqueries(&mut find_aggr)
+            .context(BuildDfLogicalPlanSnafu)?;
+        if find_aggr.is_aggr {
+            Ok(FlowType::Batching)
+        } else {
+            Ok(FlowType::Streaming)
+        }
     }
 
     #[tracing::instrument(skip_all)]
@@ -738,8 +843,46 @@ impl StatementExecutor {
             }
         );
 
-        self.alter_logical_tables_procedure(alter_table_exprs, query_context)
-            .await?;
+        // group by physical table id
+        let mut groups: HashMap<TableId, Vec<AlterTableExpr>> = HashMap::new();
+        for expr in alter_table_exprs {
+            // Get table_id from catalog_manager
+            let catalog = if expr.catalog_name.is_empty() {
+                query_context.current_catalog()
+            } else {
+                &expr.catalog_name
+            };
+            let schema = if expr.schema_name.is_empty() {
+                query_context.current_schema()
+            } else {
+                expr.schema_name.to_string()
+            };
+            let table_name = &expr.table_name;
+            let table = self
+                .catalog_manager
+                .table(catalog, &schema, table_name, Some(&query_context))
+                .await
+                .context(CatalogSnafu)?
+                .with_context(|| TableNotFoundSnafu {
+                    table_name: format_full_table_name(catalog, &schema, table_name),
+                })?;
+            let table_id = table.table_info().ident.table_id;
+            let physical_table_id = self
+                .table_metadata_manager
+                .table_route_manager()
+                .get_physical_table_id(table_id)
+                .await
+                .context(TableMetadataManagerSnafu)?;
+            groups.entry(physical_table_id).or_default().push(expr);
+        }
+
+        // Submit procedure for each physical table
+        let mut handles = Vec::with_capacity(groups.len());
+        for (_physical_table_id, exprs) in groups {
+            let fut = self.alter_logical_tables_procedure(exprs, query_context.clone());
+            handles.push(fut);
+        }
+        let _results = futures::future::try_join_all(handles).await?;
 
         Ok(Output::new_with_affected_rows(0))
     }
@@ -1583,8 +1726,15 @@ fn convert_value(
     timezone: &Timezone,
     unary_op: Option<UnaryOperator>,
 ) -> Result<Value> {
-    sql_value_to_value("<NONAME>", &data_type, value, Some(timezone), unary_op)
-        .context(ParseSqlValueSnafu)
+    sql_value_to_value(
+        "<NONAME>",
+        &data_type,
+        value,
+        Some(timezone),
+        unary_op,
+        false,
+    )
+    .context(ParseSqlValueSnafu)
 }
 
 #[cfg(test)]

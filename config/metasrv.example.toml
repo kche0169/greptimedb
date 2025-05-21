@@ -50,6 +50,10 @@ use_memory_store = false
 ## - Using shared storage (e.g., s3).
 enable_region_failover = false
 
+## Whether to allow region failover on local WAL.
+## **This option is not recommended to be set to true, because it may lead to data loss during failover.**
+allow_region_failover_on_local_wal = false
+
 ## Max allowed idle time before removing node info from metasrv memory.
 node_max_idle_time = "24hours"
 
@@ -213,19 +217,6 @@ max_log_files = 720
 ## ratio > 1 are treated as 1. Fractions < 0 are treated as 0
 [logging.tracing_sample_ratio]
 default_ratio = 1.0
-
-## The slow query log options.
-[logging.slow_query]
-## Whether to enable slow query log.
-enable = false
-
-## The threshold of slow query.
-## @toml2docs:none-default
-threshold = "10s"
-
-## The sampling ratio of slow query log. The value should be in the range of (0, 1].
-## @toml2docs:none-default
-sample_ratio = 1.0
 
 ## The datanode can export its metrics and send to Prometheus compatible service (e.g. send to `greptimedb` itself) from remote-write API.
 ## This is only used for `greptimedb` to export its own metrics internally. It's different from prometheus scrape.

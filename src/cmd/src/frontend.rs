@@ -37,7 +37,6 @@ use frontend::heartbeat::HeartbeatTask;
 use frontend::instance::builder::FrontendBuilder;
 use frontend::server::Services;
 use meta_client::{MetaClientOptions, MetaClientType};
-use query::stats::StatementStatistics;
 use servers::export_metrics::ExportMetricsTask;
 use servers::tls::{TlsMode, TlsOption};
 use snafu::{OptionExt, ResultExt};
@@ -89,7 +88,7 @@ impl App for Instance {
             .context(error::StartFrontendSnafu)
     }
 
-    async fn stop(&self) -> Result<()> {
+    async fn stop(&mut self) -> Result<()> {
         self.frontend
             .shutdown()
             .await
@@ -269,6 +268,7 @@ impl StartCommand {
             &opts.component.logging,
             &opts.component.tracing,
             opts.component.node_id.clone(),
+            opts.component.slow_query.as_ref(),
         );
         log_versions(version(), short_version(), APP_NAME);
 
@@ -368,7 +368,6 @@ impl StartCommand {
             catalog_manager,
             Arc::new(client),
             meta_client,
-            StatementStatistics::new(opts.logging.slow_query.clone()),
         )
         .with_plugin(plugins.clone())
         .with_local_cache_invalidator(layered_cache_registry)
@@ -382,7 +381,6 @@ impl StartCommand {
 
         let servers = Services::new(opts, instance.clone(), plugins)
             .build()
-            .await
             .context(error::StartFrontendSnafu)?;
 
         let frontend = Frontend {
@@ -448,8 +446,6 @@ mod tests {
     fn test_read_from_config_file() {
         let mut file = create_named_temp_file();
         let toml_str = r#"
-            mode = "distributed"
-
             [http]
             addr = "127.0.0.1:4000"
             timeout = "0s"
@@ -538,8 +534,6 @@ mod tests {
     fn test_config_precedence_order() {
         let mut file = create_named_temp_file();
         let toml_str = r#"
-            mode = "distributed"
-
             [http]
             addr = "127.0.0.1:4000"
 

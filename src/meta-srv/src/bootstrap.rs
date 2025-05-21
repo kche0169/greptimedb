@@ -66,10 +66,12 @@ use crate::election::postgres::PgElection;
 #[cfg(any(feature = "pg_kvbackend", feature = "mysql_kvbackend"))]
 use crate::election::CANDIDATE_LEASE_SECS;
 use crate::metasrv::builder::MetasrvBuilder;
-use crate::metasrv::{BackendImpl, Metasrv, MetasrvOptions, SelectorRef};
+use crate::metasrv::{BackendImpl, Metasrv, MetasrvOptions, SelectTarget, SelectorRef};
+use crate::node_excluder::NodeExcluderRef;
 use crate::selector::lease_based::LeaseBasedSelector;
 use crate::selector::load_based::LoadBasedSelector;
 use crate::selector::round_robin::RoundRobinSelector;
+use crate::selector::weight_compute::RegionNumsBasedWeightCompute;
 use crate::selector::SelectorType;
 use crate::service::admin;
 use crate::{error, Result};
@@ -77,7 +79,7 @@ use crate::{error, Result};
 pub struct MetasrvInstance {
     metasrv: Arc<Metasrv>,
 
-    httpsrv: Arc<HttpServer>,
+    http_server: HttpServer,
 
     opts: MetasrvOptions,
 
@@ -94,12 +96,11 @@ impl MetasrvInstance {
         plugins: Plugins,
         metasrv: Metasrv,
     ) -> Result<MetasrvInstance> {
-        let httpsrv = Arc::new(
-            HttpServerBuilder::new(opts.http.clone())
-                .with_metrics_handler(MetricsHandler)
-                .with_greptime_config_options(opts.to_toml().context(error::TomlFormatSnafu)?)
-                .build(),
-        );
+        let http_server = HttpServerBuilder::new(opts.http.clone())
+            .with_metrics_handler(MetricsHandler)
+            .with_greptime_config_options(opts.to_toml().context(error::TomlFormatSnafu)?)
+            .build();
+
         let metasrv = Arc::new(metasrv);
         // put metasrv into plugins for later use
         plugins.insert::<Arc<Metasrv>>(metasrv.clone());
@@ -107,7 +108,7 @@ impl MetasrvInstance {
             .context(error::InitExportMetricsTaskSnafu)?;
         Ok(MetasrvInstance {
             metasrv,
-            httpsrv,
+            http_server,
             opts,
             signal_sender: None,
             plugins,
@@ -136,10 +137,9 @@ impl MetasrvInstance {
             addr: &self.opts.http.addr,
         })?;
         let http_srv = async {
-            self.httpsrv
+            self.http_server
                 .start(addr)
                 .await
-                .map(|_| ())
                 .context(error::StartHttpSnafu)
         };
         future::try_join(metasrv, http_srv).await?;
@@ -154,11 +154,11 @@ impl MetasrvInstance {
                 .context(error::SendShutdownSignalSnafu)?;
         }
         self.metasrv.shutdown().await?;
-        self.httpsrv
+        self.http_server
             .shutdown()
             .await
             .context(error::ShutdownServerSnafu {
-                server: self.httpsrv.name(),
+                server: self.http_server.name(),
             })?;
         Ok(())
     }
@@ -294,10 +294,31 @@ pub async fn metasrv_builder(
 
     let in_memory = Arc::new(MemoryKvBackend::new()) as ResettableKvBackendRef;
 
-    let selector = match opts.selector {
-        SelectorType::LoadBased => Arc::new(LoadBasedSelector::default()) as SelectorRef,
-        SelectorType::LeaseBased => Arc::new(LeaseBasedSelector) as SelectorRef,
-        SelectorType::RoundRobin => Arc::new(RoundRobinSelector::default()) as SelectorRef,
+    let node_excluder = plugins
+        .get::<NodeExcluderRef>()
+        .unwrap_or_else(|| Arc::new(Vec::new()) as NodeExcluderRef);
+    let selector = if let Some(selector) = plugins.get::<SelectorRef>() {
+        info!("Using selector from plugins");
+        selector
+    } else {
+        let selector = match opts.selector {
+            SelectorType::LoadBased => Arc::new(LoadBasedSelector::new(
+                RegionNumsBasedWeightCompute,
+                node_excluder,
+            )) as SelectorRef,
+            SelectorType::LeaseBased => {
+                Arc::new(LeaseBasedSelector::new(node_excluder)) as SelectorRef
+            }
+            SelectorType::RoundRobin => Arc::new(RoundRobinSelector::new(
+                SelectTarget::Datanode,
+                node_excluder,
+            )) as SelectorRef,
+        };
+        info!(
+            "Using selector from options, selector type: {}",
+            opts.selector.as_ref()
+        );
+        selector
     };
 
     Ok(MetasrvBuilder::new()

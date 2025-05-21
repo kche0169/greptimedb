@@ -47,7 +47,7 @@ use common_meta::sequence::SequenceBuilder;
 use common_meta::wal_options_allocator::{build_wal_options_allocator, WalOptionsAllocatorRef};
 use common_procedure::{ProcedureInfo, ProcedureManagerRef};
 use common_telemetry::info;
-use common_telemetry::logging::{LoggingOptions, TracingOptions};
+use common_telemetry::logging::{LoggingOptions, SlowQueryOptions, TracingOptions};
 use common_time::timezone::set_default_timezone;
 use common_version::{short_version, version};
 use common_wal::config::DatanodeWalConfig;
@@ -56,8 +56,8 @@ use datanode::datanode::{Datanode, DatanodeBuilder};
 use datanode::region_server::RegionServer;
 use file_engine::config::EngineConfig as FileEngineConfig;
 use flow::{
-    FlowConfig, FlowWorkerManager, FlownodeBuilder, FlownodeInstance, FlownodeOptions,
-    FrontendClient, FrontendInvoker,
+    FlowConfig, FlownodeBuilder, FlownodeInstance, FlownodeOptions, FrontendClient,
+    FrontendInvoker, GrpcQueryHandlerWithBoxedError, StreamingEngine,
 };
 use frontend::frontend::{Frontend, FrontendOptions};
 use frontend::instance::builder::FrontendBuilder;
@@ -69,13 +69,11 @@ use frontend::service_config::{
 };
 use meta_srv::metasrv::{FLOW_ID_SEQ, TABLE_ID_SEQ};
 use mito2::config::MitoConfig;
-use query::stats::StatementStatistics;
 use serde::{Deserialize, Serialize};
 use servers::export_metrics::{ExportMetricsOption, ExportMetricsTask};
 use servers::grpc::GrpcOptions;
 use servers::http::HttpOptions;
 use servers::tls::{TlsMode, TlsOption};
-use servers::Mode;
 use snafu::ResultExt;
 use tokio::sync::RwLock;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -154,6 +152,7 @@ pub struct StandaloneOptions {
     pub init_regions_in_background: bool,
     pub init_regions_parallelism: usize,
     pub max_in_flight_write_bytes: Option<ReadableSize>,
+    pub slow_query: Option<SlowQueryOptions>,
 }
 
 impl Default for StandaloneOptions {
@@ -185,6 +184,7 @@ impl Default for StandaloneOptions {
             init_regions_in_background: false,
             init_regions_parallelism: 16,
             max_in_flight_write_bytes: None,
+            slow_query: Some(SlowQueryOptions::default()),
         }
     }
 }
@@ -224,6 +224,7 @@ impl StandaloneOptions {
             // Handle the export metrics task run by standalone to frontend for execution
             export_metrics: cloned_opts.export_metrics,
             max_in_flight_write_bytes: cloned_opts.max_in_flight_write_bytes,
+            slow_query: cloned_opts.slow_query,
             ..Default::default()
         }
     }
@@ -256,8 +257,8 @@ pub struct Instance {
 
 impl Instance {
     /// Find the socket addr of a server by its `name`.
-    pub async fn server_addr(&self, name: &str) -> Option<SocketAddr> {
-        self.frontend.server_handlers().addr(name).await
+    pub fn server_addr(&self, name: &str) -> Option<SocketAddr> {
+        self.frontend.server_handlers().addr(name)
     }
 }
 
@@ -294,7 +295,7 @@ impl App for Instance {
         Ok(())
     }
 
-    async fn stop(&self) -> Result<()> {
+    async fn stop(&mut self) -> Result<()> {
         self.frontend
             .shutdown()
             .await
@@ -448,6 +449,7 @@ impl StartCommand {
             &opts.component.logging,
             &opts.component.tracing,
             None,
+            opts.component.slow_query.as_ref(),
         );
         log_versions(version(), short_version(), APP_NAME);
 
@@ -497,12 +499,9 @@ impl StartCommand {
             .build(),
         );
 
-        let datanode = DatanodeBuilder::new(dn_opts, plugins.clone(), Mode::Standalone)
-            .with_kv_backend(kv_backend.clone())
-            .with_cache_registry(layered_cache_registry.clone())
-            .build()
-            .await
-            .context(error::StartDatanodeSnafu)?;
+        let mut builder = DatanodeBuilder::new(dn_opts, plugins.clone(), kv_backend.clone());
+        builder.with_cache_registry(layered_cache_registry.clone());
+        let datanode = builder.build().await.context(error::StartDatanodeSnafu)?;
 
         let information_extension = Arc::new(StandaloneInformationExtension::new(
             datanode.region_server(),
@@ -524,17 +523,17 @@ impl StartCommand {
             ..Default::default()
         };
 
-        // TODO(discord9): for standalone not use grpc, but just somehow get a handler to frontend grpc client without
+        // for standalone not use grpc, but get a handler to frontend grpc client without
         // actually make a connection
-        let fe_server_addr = fe_opts.grpc.bind_addr.clone();
-        let frontend_client = FrontendClient::from_static_grpc_addr(fe_server_addr);
+        let (frontend_client, frontend_instance_handler) =
+            FrontendClient::from_empty_grpc_handler();
         let flow_builder = FlownodeBuilder::new(
             flownode_options,
             plugins.clone(),
             table_metadata_manager.clone(),
             catalog_manager.clone(),
             flow_metadata_manager.clone(),
-            Arc::new(frontend_client),
+            Arc::new(frontend_client.clone()),
         );
         let flownode = flow_builder
             .build()
@@ -544,15 +543,15 @@ impl StartCommand {
 
         // set the ref to query for the local flow state
         {
-            let flow_worker_manager = flownode.flow_worker_manager();
+            let flow_streaming_engine = flownode.flow_engine().streaming_engine();
             information_extension
-                .set_flow_worker_manager(flow_worker_manager.clone())
+                .set_flow_streaming_engine(flow_streaming_engine)
                 .await;
         }
 
         let node_manager = Arc::new(StandaloneDatanodeManager {
             region_server: datanode.region_server(),
-            flow_server: flownode.flow_worker_manager(),
+            flow_server: flownode.flow_engine(),
         });
 
         let table_id_sequence = Arc::new(
@@ -598,7 +597,6 @@ impl StartCommand {
             catalog_manager.clone(),
             node_manager.clone(),
             ddl_task_executor.clone(),
-            StatementStatistics::new(opts.logging.slow_query.clone()),
         )
         .with_plugin(plugins.clone())
         .try_build()
@@ -606,10 +604,19 @@ impl StartCommand {
         .context(error::StartFrontendSnafu)?;
         let fe_instance = Arc::new(fe_instance);
 
-        let flow_worker_manager = flownode.flow_worker_manager();
+        // set the frontend client for flownode
+        let grpc_handler = fe_instance.clone() as Arc<dyn GrpcQueryHandlerWithBoxedError>;
+        let weak_grpc_handler = Arc::downgrade(&grpc_handler);
+        frontend_instance_handler
+            .lock()
+            .unwrap()
+            .replace(weak_grpc_handler);
+
+        // set the frontend invoker for flownode
+        let flow_streaming_engine = flownode.flow_engine().streaming_engine();
         // flow server need to be able to use frontend to write insert requests back
         let invoker = FrontendInvoker::build_from(
-            flow_worker_manager.clone(),
+            flow_streaming_engine.clone(),
             catalog_manager.clone(),
             kv_backend.clone(),
             layered_cache_registry.clone(),
@@ -618,14 +625,13 @@ impl StartCommand {
         )
         .await
         .context(error::StartFlownodeSnafu)?;
-        flow_worker_manager.set_frontend_invoker(invoker).await;
+        flow_streaming_engine.set_frontend_invoker(invoker).await;
 
         let export_metrics_task = ExportMetricsTask::try_new(&opts.export_metrics, Some(&plugins))
             .context(error::ServersSnafu)?;
 
         let servers = Services::new(opts, fe_instance.clone(), plugins)
             .build()
-            .await
             .context(error::StartFrontendSnafu)?;
 
         let frontend = Frontend {
@@ -694,7 +700,7 @@ pub struct StandaloneInformationExtension {
     region_server: RegionServer,
     procedure_manager: ProcedureManagerRef,
     start_time_ms: u64,
-    flow_worker_manager: RwLock<Option<Arc<FlowWorkerManager>>>,
+    flow_streaming_engine: RwLock<Option<Arc<StreamingEngine>>>,
 }
 
 impl StandaloneInformationExtension {
@@ -703,14 +709,14 @@ impl StandaloneInformationExtension {
             region_server,
             procedure_manager,
             start_time_ms: common_time::util::current_time_millis() as u64,
-            flow_worker_manager: RwLock::new(None),
+            flow_streaming_engine: RwLock::new(None),
         }
     }
 
-    /// Set the flow worker manager for the standalone instance.
-    pub async fn set_flow_worker_manager(&self, flow_worker_manager: Arc<FlowWorkerManager>) {
-        let mut guard = self.flow_worker_manager.write().await;
-        *guard = Some(flow_worker_manager);
+    /// Set the flow streaming engine for the standalone instance.
+    pub async fn set_flow_streaming_engine(&self, flow_streaming_engine: Arc<StreamingEngine>) {
+        let mut guard = self.flow_streaming_engine.write().await;
+        *guard = Some(flow_streaming_engine);
     }
 }
 
@@ -789,7 +795,7 @@ impl InformationExtension for StandaloneInformationExtension {
 
     async fn flow_stats(&self) -> std::result::Result<Option<FlowStat>, Self::Error> {
         Ok(Some(
-            self.flow_worker_manager
+            self.flow_streaming_engine
                 .read()
                 .await
                 .as_ref()
@@ -849,8 +855,6 @@ mod tests {
     fn test_read_from_config_file() {
         let mut file = create_named_temp_file();
         let toml_str = r#"
-            mode = "distributed"
-
             enable_memory_catalog = true
 
             [wal]
@@ -981,8 +985,6 @@ mod tests {
     fn test_config_precedence_order() {
         let mut file = create_named_temp_file();
         let toml_str = r#"
-            mode = "standalone"
-
             [http]
             addr = "127.0.0.1:4000"
 

@@ -12,29 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use api::v1::ddl_request::{Expr as DdlExpr, Expr};
 use api::v1::greptime_request::Request;
 use api::v1::query_request::Query;
-use api::v1::{DeleteRequests, DropFlowExpr, InsertRequests, RowDeleteRequests, RowInsertRequests};
+use api::v1::{
+    DeleteRequests, DropFlowExpr, InsertIntoPlan, InsertRequests, RowDeleteRequests,
+    RowInsertRequests,
+};
 use async_trait::async_trait;
 use auth::{PermissionChecker, PermissionCheckerRef, PermissionReq};
 use common_base::AffectedRows;
+use common_grpc::flight::FlightDecoder;
+use common_grpc::FlightData;
+use common_query::logical_plan::add_insert_to_logical_plan;
 use common_query::Output;
 use common_telemetry::tracing::{self};
-use datafusion::execution::SessionStateBuilder;
 use query::parser::PromQuery;
 use servers::interceptor::{GrpcQueryInterceptor, GrpcQueryInterceptorRef};
-use servers::query_handler::grpc::{GrpcQueryHandler, RawRecordBatch};
+use servers::query_handler::grpc::GrpcQueryHandler;
 use servers::query_handler::sql::SqlQueryHandler;
 use session::context::QueryContextRef;
 use snafu::{ensure, OptionExt, ResultExt};
-use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
+use table::metadata::TableId;
 use table::table_name::TableName;
 
 use crate::error::{
-    CatalogSnafu, Error, InFlightWriteBytesExceededSnafu, IncompleteGrpcRequestSnafu,
-    NotSupportedSnafu, PermissionSnafu, Result, SubstraitDecodeLogicalPlanSnafu,
-    TableNotFoundSnafu, TableOperationSnafu,
+    CatalogSnafu, DataFusionSnafu, Error, InFlightWriteBytesExceededSnafu,
+    IncompleteGrpcRequestSnafu, NotSupportedSnafu, PermissionSnafu, PlanStatementSnafu, Result,
+    SubstraitDecodeLogicalPlanSnafu, TableNotFoundSnafu, TableOperationSnafu,
 };
 use crate::instance::{attach_timer, Instance};
 use crate::metrics::{
@@ -68,7 +75,10 @@ impl GrpcQueryHandler for Instance {
 
         let output = match request {
             Request::Inserts(requests) => self.handle_inserts(requests, ctx.clone()).await?,
-            Request::RowInserts(requests) => self.handle_row_inserts(requests, ctx.clone()).await?,
+            Request::RowInserts(requests) => {
+                self.handle_row_inserts(requests, ctx.clone(), false)
+                    .await?
+            }
             Request::Deletes(requests) => self.handle_deletes(requests, ctx.clone()).await?,
             Request::RowDeletes(requests) => self.handle_row_deletes(requests, ctx.clone()).await?,
             Request::Query(query_request) => {
@@ -91,13 +101,30 @@ impl GrpcQueryHandler for Instance {
                     Query::LogicalPlan(plan) => {
                         // this path is useful internally when flownode needs to execute a logical plan through gRPC interface
                         let timer = GRPC_HANDLE_PLAN_ELAPSED.start_timer();
-                        let plan = DFLogicalSubstraitConvertor {}
-                            .decode(&*plan, SessionStateBuilder::default().build())
+
+                        // use dummy catalog to provide table
+                        let plan_decoder = self
+                            .query_engine()
+                            .engine_context(ctx.clone())
+                            .new_plan_decoder()
+                            .context(PlanStatementSnafu)?;
+
+                        let dummy_catalog_list =
+                            Arc::new(catalog::table_source::dummy_catalog::DummyCatalogList::new(
+                                self.catalog_manager().clone(),
+                            ));
+
+                        let logical_plan = plan_decoder
+                            .decode(bytes::Bytes::from(plan), dummy_catalog_list, true)
                             .await
                             .context(SubstraitDecodeLogicalPlanSnafu)?;
-                        let output = SqlQueryHandler::do_exec_plan(self, plan, ctx.clone()).await?;
+                        let output =
+                            SqlQueryHandler::do_exec_plan(self, logical_plan, ctx.clone()).await?;
 
                         attach_timer(output, timer)
+                    }
+                    Query::InsertIntoPlan(insert) => {
+                        self.handle_insert_plan(insert, ctx.clone()).await?
                     }
                     Query::PromRangeQuery(promql) => {
                         let timer = GRPC_HANDLE_PROMQL_ELAPSED.start_timer();
@@ -209,29 +236,35 @@ impl GrpcQueryHandler for Instance {
     async fn put_record_batch(
         &self,
         table: &TableName,
-        record_batch: RawRecordBatch,
+        table_id: &mut Option<TableId>,
+        decoder: &mut FlightDecoder,
+        data: FlightData,
     ) -> Result<AffectedRows> {
-        let _table = self
-            .catalog_manager()
-            .table(
-                &table.catalog_name,
-                &table.schema_name,
-                &table.table_name,
-                None,
-            )
-            .await
-            .context(CatalogSnafu)?
-            .with_context(|| TableNotFoundSnafu {
-                table_name: table.to_string(),
-            })?;
+        let table_id = if let Some(table_id) = table_id {
+            *table_id
+        } else {
+            let table = self
+                .catalog_manager()
+                .table(
+                    &table.catalog_name,
+                    &table.schema_name,
+                    &table.table_name,
+                    None,
+                )
+                .await
+                .context(CatalogSnafu)?
+                .with_context(|| TableNotFoundSnafu {
+                    table_name: table.to_string(),
+                })?;
+            let id = table.table_info().table_id();
+            *table_id = Some(id);
+            id
+        };
 
-        // TODO(LFC): Implement it.
-        common_telemetry::debug!(
-            "calling put_record_batch with table: {:?} and record_batch size: {}",
-            table,
-            record_batch.len()
-        );
-        Ok(record_batch.len())
+        self.inserter
+            .handle_bulk_insert(table_id, decoder, data)
+            .await
+            .context(TableOperationSnafu)
     }
 }
 
@@ -284,6 +317,91 @@ fn fill_catalog_and_schema_from_context(ddl_expr: &mut DdlExpr, ctx: &QueryConte
 }
 
 impl Instance {
+    async fn handle_insert_plan(
+        &self,
+        insert: InsertIntoPlan,
+        ctx: QueryContextRef,
+    ) -> Result<Output> {
+        let timer = GRPC_HANDLE_PLAN_ELAPSED.start_timer();
+        let table_name = insert.table_name.context(IncompleteGrpcRequestSnafu {
+            err_msg: "'table_name' is absent in InsertIntoPlan",
+        })?;
+
+        // use dummy catalog to provide table
+        let plan_decoder = self
+            .query_engine()
+            .engine_context(ctx.clone())
+            .new_plan_decoder()
+            .context(PlanStatementSnafu)?;
+
+        let dummy_catalog_list =
+            Arc::new(catalog::table_source::dummy_catalog::DummyCatalogList::new(
+                self.catalog_manager().clone(),
+            ));
+
+        // no optimize yet since we still need to add stuff
+        let logical_plan = plan_decoder
+            .decode(
+                bytes::Bytes::from(insert.logical_plan),
+                dummy_catalog_list,
+                false,
+            )
+            .await
+            .context(SubstraitDecodeLogicalPlanSnafu)?;
+
+        let table = self
+            .catalog_manager()
+            .table(
+                &table_name.catalog_name,
+                &table_name.schema_name,
+                &table_name.table_name,
+                None,
+            )
+            .await
+            .context(CatalogSnafu)?
+            .with_context(|| TableNotFoundSnafu {
+                table_name: [
+                    table_name.catalog_name.clone(),
+                    table_name.schema_name.clone(),
+                    table_name.table_name.clone(),
+                ]
+                .join("."),
+            })?;
+
+        let table_info = table.table_info();
+
+        let df_schema = Arc::new(
+            table_info
+                .meta
+                .schema
+                .arrow_schema()
+                .clone()
+                .try_into()
+                .context(DataFusionSnafu)?,
+        );
+
+        let insert_into = add_insert_to_logical_plan(table_name, df_schema, logical_plan)
+            .context(SubstraitDecodeLogicalPlanSnafu)?;
+
+        let engine_ctx = self.query_engine().engine_context(ctx.clone());
+        let state = engine_ctx.state();
+        // Analyze the plan
+        let analyzed_plan = state
+            .analyzer()
+            .execute_and_check(insert_into, state.config_options(), |_, _| {})
+            .context(common_query::error::GeneralDataFusionSnafu)
+            .context(SubstraitDecodeLogicalPlanSnafu)?;
+
+        // Optimize the plan
+        let optimized_plan = state
+            .optimize(&analyzed_plan)
+            .context(common_query::error::GeneralDataFusionSnafu)
+            .context(SubstraitDecodeLogicalPlanSnafu)?;
+
+        let output = SqlQueryHandler::do_exec_plan(self, optimized_plan, ctx.clone()).await?;
+
+        Ok(attach_timer(output, timer))
+    }
     #[tracing::instrument(skip_all)]
     pub async fn handle_inserts(
         &self,
@@ -301,9 +419,15 @@ impl Instance {
         &self,
         requests: RowInsertRequests,
         ctx: QueryContextRef,
+        accommodate_existing_schema: bool,
     ) -> Result<Output> {
         self.inserter
-            .handle_row_inserts(requests, ctx, self.statement_executor.as_ref())
+            .handle_row_inserts(
+                requests,
+                ctx,
+                self.statement_executor.as_ref(),
+                accommodate_existing_schema,
+            )
             .await
             .context(TableOperationSnafu)
     }
@@ -315,7 +439,7 @@ impl Instance {
         ctx: QueryContextRef,
     ) -> Result<Output> {
         self.inserter
-            .handle_last_non_null_inserts(requests, ctx, self.statement_executor.as_ref())
+            .handle_last_non_null_inserts(requests, ctx, self.statement_executor.as_ref(), true)
             .await
             .context(TableOperationSnafu)
     }

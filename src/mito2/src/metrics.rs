@@ -70,8 +70,8 @@ lazy_static! {
         )
         .unwrap();
     /// Counter of scheduled failed flush jobs.
-    pub static ref FLUSH_ERRORS_TOTAL: IntCounter =
-        register_int_counter!("greptime_mito_flush_errors_total", "mito flush errors total").unwrap();
+    pub static ref FLUSH_FAILURE_TOTAL: IntCounter =
+        register_int_counter!("greptime_mito_flush_failure_total", "mito flush failure total").unwrap();
     /// Elapsed time of a flush job.
     pub static ref FLUSH_ELAPSED: HistogramVec = register_histogram_vec!(
             "greptime_mito_flush_elapsed",
@@ -392,6 +392,15 @@ lazy_static! {
         // 0.01 ~ 1000
         exponential_buckets(0.01, 10.0, 6).unwrap(),
     ).unwrap();
+
+
+    pub static ref REGION_WORKER_HANDLE_WRITE_ELAPSED: HistogramVec = register_histogram_vec!(
+        "greptime_region_worker_handle_write",
+        "elapsed time for handling writes in region worker loop",
+        &["stage"],
+        exponential_buckets(0.001, 10.0, 5).unwrap()
+    ).unwrap();
+
 }
 
 /// Stager notifier to collect metrics.

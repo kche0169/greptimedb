@@ -26,6 +26,7 @@ use tonic::codegen::http;
 
 use crate::metasrv::SelectTarget;
 use crate::pubsub::Message;
+use crate::service::mailbox::Channel;
 
 #[derive(Snafu)]
 #[snafu(visibility(pub))]
@@ -336,6 +337,22 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Failed to downgrade region leader, region: {}", region_id))]
+    DowngradeLeader {
+        region_id: RegionId,
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        source: BoxedError,
+    },
+
+    #[snafu(display("Region's leader peer changed: {}", msg))]
+    LeaderPeerChanged {
+        msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Invalid arguments: {}", err_msg))]
     InvalidArguments {
         err_msg: String,
@@ -571,6 +588,13 @@ pub enum Error {
     MailboxReceiver {
         id: u64,
         err_msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Mailbox channel closed: {channel}"))]
+    MailboxChannelClosed {
+        channel: Channel,
         #[snafu(implicit)]
         location: Location,
     },
@@ -878,6 +902,7 @@ impl ErrorExt for Error {
             | Error::MailboxClosed { .. }
             | Error::MailboxTimeout { .. }
             | Error::MailboxReceiver { .. }
+            | Error::MailboxChannelClosed { .. }
             | Error::RetryLater { .. }
             | Error::RetryLaterWithSource { .. }
             | Error::StartGrpc { .. }
@@ -914,7 +939,8 @@ impl ErrorExt for Error {
             | Error::ProcedureNotFound { .. }
             | Error::TooManyPartitions { .. }
             | Error::TomlFormat { .. }
-            | Error::HandlerNotFound { .. } => StatusCode::InvalidArguments,
+            | Error::HandlerNotFound { .. }
+            | Error::LeaderPeerChanged { .. } => StatusCode::InvalidArguments,
             Error::LeaseKeyFromUtf8 { .. }
             | Error::LeaseValueFromUtf8 { .. }
             | Error::InvalidRegionKeyFromUtf8 { .. }
@@ -948,7 +974,7 @@ impl ErrorExt for Error {
             Error::StartTelemetryTask { source, .. } => source.status_code(),
 
             Error::NextSequence { source, .. } => source.status_code(),
-
+            Error::DowngradeLeader { source, .. } => source.status_code(),
             Error::RegisterProcedureLoader { source, .. } => source.status_code(),
             Error::SubmitDdlTask { source, .. } => source.status_code(),
             Error::ConvertProtoData { source, .. }

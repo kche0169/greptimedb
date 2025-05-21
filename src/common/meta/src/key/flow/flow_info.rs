@@ -121,6 +121,13 @@ pub struct FlowInfoValue {
     pub(crate) flownode_ids: BTreeMap<FlowPartitionId, FlownodeId>,
     /// The catalog name.
     pub(crate) catalog_name: String,
+    /// The query context used when create flow.
+    /// Although flow doesn't belong to any schema, this query_context is needed to remember
+    /// the query context when `create_flow` is executed
+    /// for recovering flow using the same sql&query_context after db restart.
+    /// if none, should use default query context
+    #[serde(default)]
+    pub(crate) query_context: Option<crate::rpc::ddl::QueryContext>,
     /// The flow name.
     pub(crate) flow_name: String,
     /// The raw sql.
@@ -153,6 +160,10 @@ impl FlowInfoValue {
 
     pub fn catalog_name(&self) -> &String {
         &self.catalog_name
+    }
+
+    pub fn query_context(&self) -> &Option<crate::rpc::ddl::QueryContext> {
+        &self.query_context
     }
 
     pub fn flow_name(&self) -> &String {
@@ -261,10 +272,11 @@ impl FlowInfoManager {
         let raw_value = new_flow_value.try_as_raw_value()?;
         let prev_value = current_flow_value.get_raw_bytes();
         let txn = Txn::new()
-            .when(vec![
-                Compare::new(key.clone(), CompareOp::NotEqual, None),
-                Compare::new(key.clone(), CompareOp::Equal, Some(prev_value)),
-            ])
+            .when(vec![Compare::new(
+                key.clone(),
+                CompareOp::Equal,
+                Some(prev_value),
+            )])
             .and_then(vec![TxnOp::Put(key.clone(), raw_value)])
             .or_else(vec![TxnOp::Get(key.clone())]);
 

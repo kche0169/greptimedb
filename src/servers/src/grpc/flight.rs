@@ -42,14 +42,13 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::error;
 use crate::error::{InvalidParameterSnafu, ParseJsonSnafu, Result, ToJsonSnafu};
 pub use crate::grpc::flight::stream::FlightRecordBatchStream;
 use crate::grpc::greptime_handler::{get_request_type, GreptimeRequestHandler};
 use crate::grpc::TonicResult;
 use crate::http::header::constants::GREPTIME_DB_HEADER_NAME;
 use crate::http::AUTHORIZATION_HEADER;
-use crate::query_handler::grpc::RawRecordBatch;
+use crate::{error, hint_headers};
 
 pub type TonicStream<T> = Pin<Box<dyn Stream<Item = TonicResult<T>> + Send + 'static>>;
 
@@ -184,6 +183,8 @@ impl FlightCraft for GreptimeRequestHandler {
         &self,
         request: Request<Ticket>,
     ) -> TonicResult<Response<TonicStream<FlightData>>> {
+        let hints = hint_headers::extract_hints(request.metadata());
+
         let ticket = request.into_inner().ticket;
         let request =
             GreptimeRequest::decode(ticket.as_ref()).context(error::InvalidFlightTicketSnafu)?;
@@ -195,7 +196,7 @@ impl FlightCraft for GreptimeRequestHandler {
             request_type = get_request_type(&request)
         );
         async {
-            let output = self.handle_request(request, Default::default()).await?;
+            let output = self.handle_request(request, hints).await?;
             let stream = to_flight_data_stream(output, TracingContext::from_current_span());
             Ok(Response::new(stream))
         }
@@ -257,17 +258,22 @@ impl FlightCraft for GreptimeRequestHandler {
 pub(crate) struct PutRecordBatchRequest {
     pub(crate) table_name: TableName,
     pub(crate) request_id: i64,
-    pub(crate) record_batch: RawRecordBatch,
+    pub(crate) data: FlightData,
 }
 
 impl PutRecordBatchRequest {
     fn try_new(table_name: TableName, flight_data: FlightData) -> Result<Self> {
-        let metadata: DoPutMetadata =
-            serde_json::from_slice(&flight_data.app_metadata).context(ParseJsonSnafu)?;
+        let request_id = if !flight_data.app_metadata.is_empty() {
+            let metadata: DoPutMetadata =
+                serde_json::from_slice(&flight_data.app_metadata).context(ParseJsonSnafu)?;
+            metadata.request_id()
+        } else {
+            0
+        };
         Ok(Self {
             table_name,
-            request_id: metadata.request_id(),
-            record_batch: flight_data.data_body,
+            request_id,
+            data: flight_data,
         })
     }
 }

@@ -401,6 +401,13 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Invalid flow request body: {:?}", body))]
+    InvalidFlowRequestBody {
+        body: Box<Option<api::v1::flow::flow_request::Body>>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Failed to get kv cache, err: {}", err_msg))]
     GetKvCache { err_msg: String },
 
@@ -507,11 +514,25 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to build a Kafka partition client, topic: {}, partition: {}",
+        "Failed to get a Kafka partition client, topic: {}, partition: {}",
         topic,
         partition
     ))]
-    BuildKafkaPartitionClient {
+    KafkaPartitionClient {
+        topic: String,
+        partition: i32,
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: rskafka::client::error::Error,
+    },
+
+    #[snafu(display(
+        "Failed to get offset from Kafka, topic: {}, partition: {}",
+        topic,
+        partition
+    ))]
+    KafkaGetOffset {
         topic: String,
         partition: i32,
         #[snafu(implicit)]
@@ -783,6 +804,14 @@ pub enum Error {
         #[snafu(source)]
         source: common_procedure::error::Error,
     },
+
+    #[snafu(display("Failed to parse timezone"))]
+    InvalidTimeZone {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: common_time::error::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -828,7 +857,7 @@ impl ErrorExt for Error {
             | EncodeWalOptions { .. }
             | BuildKafkaClient { .. }
             | BuildKafkaCtrlClient { .. }
-            | BuildKafkaPartitionClient { .. }
+            | KafkaPartitionClient { .. }
             | ResolveKafkaEndpoint { .. }
             | ProduceRecord { .. }
             | CreateKafkaWalTopic { .. }
@@ -837,7 +866,8 @@ impl ErrorExt for Error {
             | ProcedureOutput { .. }
             | FromUtf8 { .. }
             | MetadataCorruption { .. }
-            | ParseWalOptions { .. } => StatusCode::Unexpected,
+            | ParseWalOptions { .. }
+            | KafkaGetOffset { .. } => StatusCode::Unexpected,
 
             SendMessage { .. } | GetKvCache { .. } | CacheNotGet { .. } => StatusCode::Internal,
 
@@ -853,7 +883,9 @@ impl ErrorExt for Error {
             | TlsConfig { .. }
             | InvalidSetDatabaseOption { .. }
             | InvalidUnsetDatabaseOption { .. }
-            | InvalidTopicNamePrefix { .. } => StatusCode::InvalidArguments,
+            | InvalidTopicNamePrefix { .. }
+            | InvalidTimeZone { .. } => StatusCode::InvalidArguments,
+            InvalidFlowRequestBody { .. } => StatusCode::InvalidArguments,
 
             FlowNotFound { .. } => StatusCode::FlowNotFound,
             FlowRouteNotFound { .. } => StatusCode::Unexpected,

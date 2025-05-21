@@ -154,6 +154,7 @@
 | `region_engine.mito.index.metadata_cache_size` | String | `64MiB` | Cache size for inverted index metadata. |
 | `region_engine.mito.index.content_cache_size` | String | `128MiB` | Cache size for inverted index content. |
 | `region_engine.mito.index.content_cache_page_size` | String | `64KiB` | Page size for inverted index content cache. |
+| `region_engine.mito.index.result_cache_size` | String | `128MiB` | Cache size for index result. |
 | `region_engine.mito.inverted_index` | -- | -- | The options for inverted index in Mito engine. |
 | `region_engine.mito.inverted_index.create_on_flush` | String | `auto` | Whether to create the index on flush.<br/>- `auto`: automatically (default)<br/>- `disable`: never |
 | `region_engine.mito.inverted_index.create_on_compaction` | String | `auto` | Whether to create the index on compaction.<br/>- `auto`: automatically (default)<br/>- `disable`: never |
@@ -188,10 +189,11 @@
 | `logging.max_log_files` | Integer | `720` | The maximum amount of log files. |
 | `logging.tracing_sample_ratio` | -- | -- | The percentage of tracing will be sampled and exported.<br/>Valid range `[0, 1]`, 1 means all traces are sampled, 0 means all traces are not sampled, the default value is 1.<br/>ratio > 1 are treated as 1. Fractions < 0 are treated as 0 |
 | `logging.tracing_sample_ratio.default_ratio` | Float | `1.0` | -- |
-| `logging.slow_query` | -- | -- | The slow query log options. |
-| `logging.slow_query.enable` | Bool | `false` | Whether to enable slow query log. |
-| `logging.slow_query.threshold` | String | Unset | The threshold of slow query. |
-| `logging.slow_query.sample_ratio` | Float | Unset | The sampling ratio of slow query log. The value should be in the range of (0, 1]. |
+| `slow_query` | -- | -- | The slow query log options. |
+| `slow_query.enable` | Bool | `false` | Whether to enable slow query log. |
+| `slow_query.record_type` | String | Unset | The record type of slow queries. It can be `system_table` or `log`. |
+| `slow_query.threshold` | String | Unset | The threshold of slow query. |
+| `slow_query.sample_ratio` | Float | Unset | The sampling ratio of slow query log. The value should be in the range of (0, 1]. |
 | `export_metrics` | -- | -- | The datanode can export its metrics and send to Prometheus compatible service (e.g. send to `greptimedb` itself) from remote-write API.<br/>This is only used for `greptimedb` to export its own metrics internally. It's different from prometheus scrape. |
 | `export_metrics.enable` | Bool | `false` | whether enable export metrics. |
 | `export_metrics.write_interval` | String | `30s` | The interval of export metrics. |
@@ -288,10 +290,12 @@
 | `logging.max_log_files` | Integer | `720` | The maximum amount of log files. |
 | `logging.tracing_sample_ratio` | -- | -- | The percentage of tracing will be sampled and exported.<br/>Valid range `[0, 1]`, 1 means all traces are sampled, 0 means all traces are not sampled, the default value is 1.<br/>ratio > 1 are treated as 1. Fractions < 0 are treated as 0 |
 | `logging.tracing_sample_ratio.default_ratio` | Float | `1.0` | -- |
-| `logging.slow_query` | -- | -- | The slow query log options. |
-| `logging.slow_query.enable` | Bool | `false` | Whether to enable slow query log. |
-| `logging.slow_query.threshold` | String | Unset | The threshold of slow query. |
-| `logging.slow_query.sample_ratio` | Float | Unset | The sampling ratio of slow query log. The value should be in the range of (0, 1]. |
+| `slow_query` | -- | -- | The slow query log options. |
+| `slow_query.enable` | Bool | `true` | Whether to enable slow query log. |
+| `slow_query.record_type` | String | `system_table` | The record type of slow queries. It can be `system_table` or `log`.<br/>If `system_table` is selected, the slow queries will be recorded in a system table `greptime_private.slow_queries`.<br/>If `log` is selected, the slow queries will be logged in a log file `greptimedb-slow-queries.*`. |
+| `slow_query.threshold` | String | `30s` | The threshold of slow query. It can be human readable time string, for example: `10s`, `100ms`, `1s`. |
+| `slow_query.sample_ratio` | Float | `1.0` | The sampling ratio of slow query log. The value should be in the range of (0, 1]. For example, `0.1` means 10% of the slow queries will be logged and `1.0` means all slow queries will be logged. |
+| `slow_query.ttl` | String | `30d` | The TTL of the `slow_queries` system table. Default is `30d` when `record_type` is `system_table`. |
 | `export_metrics` | -- | -- | The datanode can export its metrics and send to Prometheus compatible service (e.g. send to `greptimedb` itself) from remote-write API.<br/>This is only used for `greptimedb` to export its own metrics internally. It's different from prometheus scrape. |
 | `export_metrics.enable` | Bool | `false` | whether enable export metrics. |
 | `export_metrics.write_interval` | String | `30s` | The interval of export metrics. |
@@ -319,6 +323,7 @@
 | `selector` | String | `round_robin` | Datanode selector type.<br/>- `round_robin` (default value)<br/>- `lease_based`<br/>- `load_based`<br/>For details, please see "https://docs.greptime.com/developer-guide/metasrv/selector". |
 | `use_memory_store` | Bool | `false` | Store data in memory. |
 | `enable_region_failover` | Bool | `false` | Whether to enable region failover.<br/>This feature is only available on GreptimeDB running on cluster mode and<br/>- Using Remote WAL<br/>- Using shared storage (e.g., s3). |
+| `allow_region_failover_on_local_wal` | Bool | `false` | Whether to allow region failover on local WAL.<br/>**This option is not recommended to be set to true, because it may lead to data loss during failover.** |
 | `node_max_idle_time` | String | `24hours` | Max allowed idle time before removing node info from metasrv memory. |
 | `enable_telemetry` | Bool | `true` | Whether to enable greptimedb telemetry. Enabled by default. |
 | `runtime` | -- | -- | The runtime options. |
@@ -361,10 +366,6 @@
 | `logging.max_log_files` | Integer | `720` | The maximum amount of log files. |
 | `logging.tracing_sample_ratio` | -- | -- | The percentage of tracing will be sampled and exported.<br/>Valid range `[0, 1]`, 1 means all traces are sampled, 0 means all traces are not sampled, the default value is 1.<br/>ratio > 1 are treated as 1. Fractions < 0 are treated as 0 |
 | `logging.tracing_sample_ratio.default_ratio` | Float | `1.0` | -- |
-| `logging.slow_query` | -- | -- | The slow query log options. |
-| `logging.slow_query.enable` | Bool | `false` | Whether to enable slow query log. |
-| `logging.slow_query.threshold` | String | Unset | The threshold of slow query. |
-| `logging.slow_query.sample_ratio` | Float | Unset | The sampling ratio of slow query log. The value should be in the range of (0, 1]. |
 | `export_metrics` | -- | -- | The datanode can export its metrics and send to Prometheus compatible service (e.g. send to `greptimedb` itself) from remote-write API.<br/>This is only used for `greptimedb` to export its own metrics internally. It's different from prometheus scrape. |
 | `export_metrics.enable` | Bool | `false` | whether enable export metrics. |
 | `export_metrics.write_interval` | String | `30s` | The interval of export metrics. |
@@ -494,6 +495,7 @@
 | `region_engine.mito.index.metadata_cache_size` | String | `64MiB` | Cache size for inverted index metadata. |
 | `region_engine.mito.index.content_cache_size` | String | `128MiB` | Cache size for inverted index content. |
 | `region_engine.mito.index.content_cache_page_size` | String | `64KiB` | Page size for inverted index content cache. |
+| `region_engine.mito.index.result_cache_size` | String | `128MiB` | Cache size for index result. |
 | `region_engine.mito.inverted_index` | -- | -- | The options for inverted index in Mito engine. |
 | `region_engine.mito.inverted_index.create_on_flush` | String | `auto` | Whether to create the index on flush.<br/>- `auto`: automatically (default)<br/>- `disable`: never |
 | `region_engine.mito.inverted_index.create_on_compaction` | String | `auto` | Whether to create the index on compaction.<br/>- `auto`: automatically (default)<br/>- `disable`: never |
@@ -528,10 +530,6 @@
 | `logging.max_log_files` | Integer | `720` | The maximum amount of log files. |
 | `logging.tracing_sample_ratio` | -- | -- | The percentage of tracing will be sampled and exported.<br/>Valid range `[0, 1]`, 1 means all traces are sampled, 0 means all traces are not sampled, the default value is 1.<br/>ratio > 1 are treated as 1. Fractions < 0 are treated as 0 |
 | `logging.tracing_sample_ratio.default_ratio` | Float | `1.0` | -- |
-| `logging.slow_query` | -- | -- | The slow query log options. |
-| `logging.slow_query.enable` | Bool | `false` | Whether to enable slow query log. |
-| `logging.slow_query.threshold` | String | Unset | The threshold of slow query. |
-| `logging.slow_query.sample_ratio` | Float | Unset | The sampling ratio of slow query log. The value should be in the range of (0, 1]. |
 | `export_metrics` | -- | -- | The datanode can export its metrics and send to Prometheus compatible service (e.g. send to `greptimedb` itself) from remote-write API.<br/>This is only used for `greptimedb` to export its own metrics internally. It's different from prometheus scrape. |
 | `export_metrics.enable` | Bool | `false` | whether enable export metrics. |
 | `export_metrics.write_interval` | String | `30s` | The interval of export metrics. |
@@ -584,9 +582,5 @@
 | `logging.max_log_files` | Integer | `720` | The maximum amount of log files. |
 | `logging.tracing_sample_ratio` | -- | -- | The percentage of tracing will be sampled and exported.<br/>Valid range `[0, 1]`, 1 means all traces are sampled, 0 means all traces are not sampled, the default value is 1.<br/>ratio > 1 are treated as 1. Fractions < 0 are treated as 0 |
 | `logging.tracing_sample_ratio.default_ratio` | Float | `1.0` | -- |
-| `logging.slow_query` | -- | -- | The slow query log options. |
-| `logging.slow_query.enable` | Bool | `false` | Whether to enable slow query log. |
-| `logging.slow_query.threshold` | String | Unset | The threshold of slow query. |
-| `logging.slow_query.sample_ratio` | Float | Unset | The sampling ratio of slow query log. The value should be in the range of (0, 1]. |
 | `tracing` | -- | -- | The tracing options. Only effect when compiled with `tokio-console` feature. |
 | `tracing.tokio_console_addr` | String | Unset | The tokio console address. |

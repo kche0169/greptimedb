@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::Display;
 use std::io::BufRead;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -33,15 +34,15 @@ use datatypes::value::column_data_to_json;
 use headers::ContentType;
 use lazy_static::lazy_static;
 use pipeline::util::to_pipeline_version;
-use pipeline::{GreptimePipelineParams, PipelineDefinition, PipelineMap};
+use pipeline::{GreptimePipelineParams, PipelineContext, PipelineDefinition, PipelineMap};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Deserializer, Map, Value};
 use session::context::{Channel, QueryContext, QueryContextRef};
 use snafu::{ensure, OptionExt, ResultExt};
+use strum::{EnumIter, IntoEnumIterator};
 
 use crate::error::{
-    status_code_to_http_status, Error, InvalidParameterSnafu, ParseJsonSnafu, PipelineSnafu,
-    Result, UnsupportedContentTypeSnafu,
+    status_code_to_http_status, Error, InvalidParameterSnafu, ParseJsonSnafu, PipelineSnafu, Result,
 };
 use crate::http::header::constants::GREPTIME_PIPELINE_PARAMS_HEADER;
 use crate::http::header::{CONTENT_TYPE_NDJSON_STR, CONTENT_TYPE_PROTOBUF_STR};
@@ -100,7 +101,7 @@ pub struct LogIngesterQueryParams {
 /// LogIngestRequest is the internal request for log ingestion. The raw log input can be transformed into multiple LogIngestRequests.
 /// Multiple LogIngestRequests will be ingested into the same database with the same pipeline.
 #[derive(Debug, PartialEq)]
-pub(crate) struct LogIngestRequest {
+pub(crate) struct PipelineIngestRequest {
     /// The table where the log data will be written to.
     pub table: String,
     /// The log data to be ingested.
@@ -300,7 +301,7 @@ fn transform_ndjson_array_factory(
                         if !ignore_error {
                             warn!("invalid item in array: {:?}", item_value);
                             return InvalidParameterSnafu {
-                                reason: format!("invalid item:{} in array", item_value),
+                                reason: format!("invalid item: {} in array", item_value),
                             }
                             .fail();
                         }
@@ -325,12 +326,15 @@ async fn dryrun_pipeline_inner(
 ) -> Result<Response> {
     let params = GreptimePipelineParams::default();
 
+    let pipeline_def = PipelineDefinition::Resolved(pipeline);
+    let pipeline_ctx = PipelineContext::new(&pipeline_def, &params, query_ctx.channel());
     let results = run_pipeline(
         &pipeline_handler,
-        &PipelineDefinition::Resolved(pipeline),
-        &params,
-        value,
-        "dry_run".to_owned(),
+        &pipeline_ctx,
+        PipelineIngestRequest {
+            table: "dry_run".to_owned(),
+            values: value,
+        },
         query_ctx,
         true,
     )
@@ -428,7 +432,8 @@ pub struct PipelineDryrunParams {
     pub pipeline_name: Option<String>,
     pub pipeline_version: Option<String>,
     pub pipeline: Option<String>,
-    pub data: Vec<Value>,
+    pub data_type: Option<String>,
+    pub data: String,
 }
 
 /// Check if the payload is valid json
@@ -471,6 +476,24 @@ fn add_step_info_for_pipeline_dryrun_error(step_msg: &str, e: Error) -> Response
     (status_code_to_http_status(&e.status_code()), body).into_response()
 }
 
+/// Parse the data with given content type
+/// If the content type is invalid, return error
+/// content type is one of application/json, text/plain, application/x-ndjson
+fn parse_dryrun_data(data_type: String, data: String) -> Result<Vec<PipelineMap>> {
+    if let Ok(content_type) = ContentType::from_str(&data_type) {
+        extract_pipeline_value_by_content_type(content_type, Bytes::from(data), false)
+    } else {
+        InvalidParameterSnafu {
+            reason: format!(
+                "invalid content type: {}, expected: one of {}",
+                data_type,
+                EventPayloadResolver::support_content_type_list().join(", ")
+            ),
+        }
+        .fail()
+    }
+}
+
 #[axum_macros::debug_handler]
 pub async fn pipeline_dryrun(
     State(log_state): State<LogState>,
@@ -486,7 +509,10 @@ pub async fn pipeline_dryrun(
 
     match check_pipeline_dryrun_params_valid(&payload) {
         Some(params) => {
-            let data = pipeline::json_array_to_map(params.data).context(PipelineSnafu)?;
+            let data = parse_dryrun_data(
+                params.data_type.unwrap_or("application/json".to_string()),
+                params.data,
+            )?;
 
             check_data_valid(data.len())?;
 
@@ -603,7 +629,7 @@ pub async fn log_ingester(
     ingest_logs_inner(
         handler,
         pipeline,
-        vec![LogIngestRequest {
+        vec![PipelineIngestRequest {
             table: table_name,
             values: value,
         }],
@@ -613,69 +639,159 @@ pub async fn log_ingester(
     .await
 }
 
+#[derive(Debug, EnumIter)]
+enum EventPayloadResolverInner {
+    Json,
+    Ndjson,
+    Text,
+}
+
+impl Display for EventPayloadResolverInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventPayloadResolverInner::Json => write!(f, "{}", *JSON_CONTENT_TYPE),
+            EventPayloadResolverInner::Ndjson => write!(f, "{}", *NDJSON_CONTENT_TYPE),
+            EventPayloadResolverInner::Text => write!(f, "{}", *TEXT_CONTENT_TYPE),
+        }
+    }
+}
+
+impl TryFrom<&ContentType> for EventPayloadResolverInner {
+    type Error = Error;
+
+    fn try_from(content_type: &ContentType) -> Result<Self> {
+        match content_type {
+            x if *x == *JSON_CONTENT_TYPE => Ok(EventPayloadResolverInner::Json),
+            x if *x == *NDJSON_CONTENT_TYPE => Ok(EventPayloadResolverInner::Ndjson),
+            x if *x == *TEXT_CONTENT_TYPE || *x == *TEXT_UTF8_CONTENT_TYPE => {
+                Ok(EventPayloadResolverInner::Text)
+            }
+            _ => InvalidParameterSnafu {
+                reason: format!(
+                    "invalid content type: {}, expected: one of {}",
+                    content_type,
+                    EventPayloadResolver::support_content_type_list().join(", ")
+                ),
+            }
+            .fail(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EventPayloadResolver<'a> {
+    inner: EventPayloadResolverInner,
+    /// The content type of the payload.
+    /// keep it for logging original content type
+    #[allow(dead_code)]
+    content_type: &'a ContentType,
+}
+
+impl EventPayloadResolver<'_> {
+    pub(super) fn support_content_type_list() -> Vec<String> {
+        EventPayloadResolverInner::iter()
+            .map(|x| x.to_string())
+            .collect()
+    }
+}
+
+impl<'a> TryFrom<&'a ContentType> for EventPayloadResolver<'a> {
+    type Error = Error;
+
+    fn try_from(content_type: &'a ContentType) -> Result<Self> {
+        let inner = EventPayloadResolverInner::try_from(content_type)?;
+        Ok(EventPayloadResolver {
+            inner,
+            content_type,
+        })
+    }
+}
+
+impl EventPayloadResolver<'_> {
+    fn parse_payload(&self, payload: Bytes, ignore_errors: bool) -> Result<Vec<PipelineMap>> {
+        match self.inner {
+            EventPayloadResolverInner::Json => {
+                pipeline::json_array_to_map(transform_ndjson_array_factory(
+                    Deserializer::from_slice(&payload).into_iter(),
+                    ignore_errors,
+                )?)
+                .context(PipelineSnafu)
+            }
+            EventPayloadResolverInner::Ndjson => {
+                let mut result = Vec::with_capacity(1000);
+                for (index, line) in payload.lines().enumerate() {
+                    let mut line = match line {
+                        Ok(line) if !line.is_empty() => line,
+                        Ok(_) => continue, // Skip empty lines
+                        Err(_) if ignore_errors => continue,
+                        Err(e) => {
+                            warn!(e; "invalid string at index: {}", index);
+                            return InvalidParameterSnafu {
+                                reason: format!("invalid line at index: {}", index),
+                            }
+                            .fail();
+                        }
+                    };
+
+                    // simd_json, according to description, only de-escapes string at character level,
+                    // like any other json parser. So it should be safe here.
+                    if let Ok(v) = simd_json::to_owned_value(unsafe { line.as_bytes_mut() }) {
+                        let v = pipeline::simd_json_to_map(v).context(PipelineSnafu)?;
+                        result.push(v);
+                    } else if !ignore_errors {
+                        warn!("invalid JSON at index: {}, content: {:?}", index, line);
+                        return InvalidParameterSnafu {
+                            reason: format!("invalid JSON at index: {}", index),
+                        }
+                        .fail();
+                    }
+                }
+                Ok(result)
+            }
+            EventPayloadResolverInner::Text => {
+                let result = payload
+                    .lines()
+                    .filter_map(|line| line.ok().filter(|line| !line.is_empty()))
+                    .map(|line| {
+                        let mut map = PipelineMap::new();
+                        map.insert("message".to_string(), pipeline::Value::String(line));
+                        map
+                    })
+                    .collect::<Vec<_>>();
+                Ok(result)
+            }
+        }
+    }
+}
+
 fn extract_pipeline_value_by_content_type(
     content_type: ContentType,
     payload: Bytes,
     ignore_errors: bool,
 ) -> Result<Vec<PipelineMap>> {
-    Ok(match content_type {
-        ct if ct == *JSON_CONTENT_TYPE => {
-            // `simd_json` have not support stream and ndjson, see https://github.com/simd-lite/simd-json/issues/349
-            pipeline::json_array_to_map(transform_ndjson_array_factory(
-                Deserializer::from_slice(&payload).into_iter(),
-                ignore_errors,
-            )?)
-            .context(PipelineSnafu)?
-        }
-        ct if ct == *NDJSON_CONTENT_TYPE => {
-            let mut result = Vec::with_capacity(1000);
-            for (index, line) in payload.lines().enumerate() {
-                let mut line = match line {
-                    Ok(line) if !line.is_empty() => line,
-                    Ok(_) => continue, // Skip empty lines
-                    Err(_) if ignore_errors => continue,
-                    Err(e) => {
-                        warn!(e; "invalid string at index: {}", index);
-                        return InvalidParameterSnafu {
-                            reason: format!("invalid line at index: {}", index),
+    EventPayloadResolver::try_from(&content_type).and_then(|resolver| {
+        resolver
+            .parse_payload(payload, ignore_errors)
+            .map_err(|e| match &e {
+                Error::InvalidParameter { reason, .. } if content_type == *JSON_CONTENT_TYPE => {
+                    if reason.contains("invalid item:") {
+                        InvalidParameterSnafu {
+                            reason: "json format error, please check the date is valid JSON.",
                         }
-                        .fail();
+                        .build()
+                    } else {
+                        e
                     }
-                };
-
-                // simd_json, according to description, only de-escapes string at character level,
-                // like any other json parser. So it should be safe here.
-                if let Ok(v) = simd_json::to_owned_value(unsafe { line.as_bytes_mut() }) {
-                    let v = pipeline::simd_json_to_map(v).context(PipelineSnafu)?;
-                    result.push(v);
-                } else if !ignore_errors {
-                    warn!("invalid JSON at index: {}, content: {:?}", index, line);
-                    return InvalidParameterSnafu {
-                        reason: format!("invalid JSON at index: {}", index),
-                    }
-                    .fail();
                 }
-            }
-            result
-        }
-        ct if ct == *TEXT_CONTENT_TYPE || ct == *TEXT_UTF8_CONTENT_TYPE => payload
-            .lines()
-            .filter_map(|line| line.ok().filter(|line| !line.is_empty()))
-            .map(|line| {
-                let mut map = PipelineMap::new();
-                map.insert("message".to_string(), pipeline::Value::String(line));
-                map
+                _ => e,
             })
-            .collect::<Vec<_>>(),
-
-        _ => UnsupportedContentTypeSnafu { content_type }.fail()?,
     })
 }
 
 pub(crate) async fn ingest_logs_inner(
-    state: PipelineHandlerRef,
+    handler: PipelineHandlerRef,
     pipeline: PipelineDefinition,
-    log_ingest_requests: Vec<LogIngestRequest>,
+    log_ingest_requests: Vec<PipelineIngestRequest>,
     query_ctx: QueryContextRef,
     headers: HeaderMap,
 ) -> Result<HttpResponse> {
@@ -690,22 +806,15 @@ pub(crate) async fn ingest_logs_inner(
             .and_then(|v| v.to_str().ok()),
     );
 
-    for request in log_ingest_requests {
-        let requests = run_pipeline(
-            &state,
-            &pipeline,
-            &pipeline_params,
-            request.values,
-            request.table,
-            &query_ctx,
-            true,
-        )
-        .await?;
+    let pipeline_ctx = PipelineContext::new(&pipeline, &pipeline_params, query_ctx.channel());
+    for pipeline_req in log_ingest_requests {
+        let requests =
+            run_pipeline(&handler, &pipeline_ctx, pipeline_req, &query_ctx, true).await?;
 
         insert_requests.extend(requests);
     }
 
-    let output = state
+    let output = handler
         .insert(
             RowInsertRequests {
                 inserts: insert_requests,

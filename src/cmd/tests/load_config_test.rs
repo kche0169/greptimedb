@@ -18,7 +18,7 @@ use cmd::options::GreptimeOptions;
 use cmd::standalone::StandaloneOptions;
 use common_config::Configurable;
 use common_options::datanode::{ClientOptions, DatanodeClientOptions};
-use common_telemetry::logging::{LoggingOptions, SlowQueryOptions, DEFAULT_OTLP_ENDPOINT};
+use common_telemetry::logging::{LoggingOptions, DEFAULT_OTLP_ENDPOINT};
 use common_wal::config::raft_engine::RaftEngineConfig;
 use common_wal::config::DatanodeWalConfig;
 use datanode::config::{DatanodeOptions, RegionEngineConfig, StorageConfig};
@@ -74,6 +74,7 @@ fn test_load_datanode_example_config() {
                 RegionEngineConfig::File(FileEngineConfig {}),
                 RegionEngineConfig::Metric(MetricEngineConfig {
                     experimental_sparse_primary_key_encoding: false,
+                    flush_metadata_region_interval: Duration::from_secs(30),
                 }),
             ],
             logging: LoggingOptions {
@@ -166,11 +167,6 @@ fn test_load_metasrv_example_config() {
                 level: Some("info".to_string()),
                 otlp_endpoint: Some(DEFAULT_OTLP_ENDPOINT.to_string()),
                 tracing_sample_ratio: Some(Default::default()),
-                slow_query: SlowQueryOptions {
-                    enable: false,
-                    threshold: None,
-                    sample_ratio: None,
-                },
                 ..Default::default()
             },
             datanode: DatanodeClientOptions {
@@ -216,6 +212,7 @@ fn test_load_standalone_example_config() {
                 RegionEngineConfig::File(FileEngineConfig {}),
                 RegionEngineConfig::Metric(MetricEngineConfig {
                     experimental_sparse_primary_key_encoding: false,
+                    flush_metadata_region_interval: Duration::from_secs(30),
                 }),
             ],
             storage: StorageConfig {

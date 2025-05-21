@@ -141,11 +141,6 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         // But the flush is skipped if memtables are empty. Thus should update the `topic_latest_entry_id`
         // when handling flush request instead of in `schedule_flush` or `flush_finished`.
         self.update_topic_latest_entry_id(&region);
-        info!(
-            "Region {} flush request, high watermark: {}",
-            region_id,
-            region.topic_latest_entry_id.load(Ordering::Relaxed)
-        );
 
         let reason = if region.is_downgrading() {
             FlushReason::Downgrading
@@ -241,13 +236,14 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         request.on_success();
 
         // Handle pending requests for the region.
-        if let Some((mut ddl_requests, mut write_requests)) =
+        if let Some((mut ddl_requests, mut write_requests, mut bulk_writes)) =
             self.flush_scheduler.on_flush_success(region_id)
         {
             // Perform DDLs first because they require empty memtables.
             self.handle_ddl_requests(&mut ddl_requests).await;
             // Handle pending write requests, we don't stall these requests.
-            self.handle_write_requests(&mut write_requests, false).await;
+            self.handle_write_requests(&mut write_requests, &mut bulk_writes, false)
+                .await;
         }
 
         // Handle stalled requests.
@@ -268,15 +264,17 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 .store()
                 .high_watermark(&region.provider)
                 .unwrap_or(0);
-            if high_watermark != 0 {
+            let topic_last_entry_id = region.topic_latest_entry_id.load(Ordering::Relaxed);
+
+            if high_watermark != 0 && high_watermark > topic_last_entry_id {
                 region
                     .topic_latest_entry_id
                     .store(high_watermark, Ordering::Relaxed);
+                info!(
+                    "Region {} high watermark updated to {}",
+                    region.region_id, high_watermark
+                );
             }
-            info!(
-                "Region {} high watermark updated to {}",
-                region.region_id, high_watermark
-            );
         }
     }
 }

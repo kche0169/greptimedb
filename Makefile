@@ -8,7 +8,7 @@ CARGO_BUILD_OPTS := --locked
 IMAGE_REGISTRY ?= docker.io
 IMAGE_NAMESPACE ?= greptime
 IMAGE_TAG ?= latest
-DEV_BUILDER_IMAGE_TAG ?= 2024-12-25-a71b93dd-20250305072908
+DEV_BUILDER_IMAGE_TAG ?= 2025-05-19-b2377d4b-20250520045554
 BUILDX_MULTI_PLATFORM_BUILD ?= false
 BUILDX_BUILDER_NAME ?= gtbuilder
 BASE_IMAGE ?= ubuntu
@@ -221,6 +221,16 @@ start-cluster: ## Start the greptimedb cluster with etcd by using docker compose
 .PHONY: stop-cluster
 stop-cluster: ## Stop the greptimedb cluster that created by docker compose.
 	docker compose -f ./docker/docker-compose/cluster-with-etcd.yaml stop
+
+##@ Grafana
+
+.PHONY: check-dashboards
+check-dashboards: ## Check the Grafana dashboards.
+	@./grafana/scripts/check.sh
+
+.PHONY: dashboards
+dashboards: ## Generate the Grafana dashboards for standalone mode and intermediate dashboards.
+	@./grafana/scripts/gen-dashboards.sh
 
 ##@ Docs
 config-docs: ## Generate configuration documentation from toml files.

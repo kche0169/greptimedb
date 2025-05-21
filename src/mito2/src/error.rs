@@ -243,6 +243,8 @@ pub enum Error {
         region_id: RegionId,
         column: String,
         source: datatypes::Error,
+        #[snafu(implicit)]
+        location: Location,
     },
 
     #[snafu(display("Failed to build entry, region_id: {}", region_id))]
@@ -710,8 +712,8 @@ pub enum Error {
         error: std::io::Error,
     },
 
-    #[snafu(display("Failed to filter record batch"))]
-    FilterRecordBatch {
+    #[snafu(display("Record batch error"))]
+    RecordBatch {
         source: common_recordbatch::error::Error,
         #[snafu(implicit)]
         location: Location,
@@ -1022,13 +1024,16 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display(
-        "Failed to convert ConcreteDataType to ColumnDataType: {:?}",
-        data_type
-    ))]
-    ConvertDataType {
-        data_type: ConcreteDataType,
-        source: api::error::Error,
+    #[snafu(display("Failed to scan series"))]
+    ScanSeries {
+        #[snafu(implicit)]
+        location: Location,
+        source: Arc<Error>,
+    },
+
+    #[snafu(display("Partition {} scan multiple times", partition))]
+    ScanMultiTimes {
+        partition: usize,
         #[snafu(implicit)]
         location: Location,
     },
@@ -1154,7 +1159,7 @@ impl ErrorExt for Error {
 
             External { source, .. } => source.status_code(),
 
-            FilterRecordBatch { source, .. } => source.status_code(),
+            RecordBatch { source, .. } => source.status_code(),
 
             Download { .. } | Upload { .. } => StatusCode::StorageUnavailable,
             ChecksumMismatch { .. } => StatusCode::Unexpected,
@@ -1183,7 +1188,10 @@ impl ErrorExt for Error {
             ManualCompactionOverride {} => StatusCode::Cancelled,
 
             IncompatibleWalProviderChange { .. } => StatusCode::InvalidArguments,
-            ConvertDataType { .. } => StatusCode::Internal,
+
+            ScanSeries { source, .. } => source.status_code(),
+
+            ScanMultiTimes { .. } => StatusCode::InvalidArguments,
         }
     }
 

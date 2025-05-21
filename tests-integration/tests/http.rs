@@ -43,7 +43,7 @@ use servers::http::result::greptime_result_v1::GreptimedbV1Response;
 use servers::http::result::influxdb_result_v1::{InfluxdbOutput, InfluxdbV1Response};
 use servers::http::test_helpers::{TestClient, TestResponse};
 use servers::http::GreptimeQueryOutput;
-use servers::prom_store;
+use servers::prom_store::{self, mock_timeseries_new_label};
 use table::table_name::TableName;
 use tests_integration::test_util::{
     setup_test_http_app, setup_test_http_app_with_frontend,
@@ -91,11 +91,14 @@ macro_rules! http_tests {
                 test_config_api,
                 test_dashboard_path,
                 test_prometheus_remote_write,
+                test_prometheus_remote_write_with_pipeline,
                 test_vm_proto_remote_write,
 
                 test_pipeline_api,
                 test_test_pipeline_api,
                 test_plain_text_ingestion,
+                test_pipeline_auto_transform,
+                test_pipeline_auto_transform_with_select,
                 test_identity_pipeline,
                 test_identity_pipeline_with_flatten,
                 test_identity_pipeline_with_custom_ts,
@@ -268,7 +271,7 @@ pub async fn test_sql_api(store_type: StorageType) {
 
     // test insert and select
     let res = client
-        .get("/v1/sql?sql=insert into demo values('host', 66.6, 1024, 0)")
+        .get("/v1/sql?sql=insert into demo values('host, \"name', 66.6, 1024, 0)")
         .send()
         .await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -287,7 +290,7 @@ pub async fn test_sql_api(store_type: StorageType) {
     assert_eq!(
         output[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"schema":{"column_schemas":[{"name":"host","data_type":"String"},{"name":"cpu","data_type":"Float64"},{"name":"memory","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[["host",66.6,1024.0,0]],"total_rows":1}
+            "records":{"schema":{"column_schemas":[{"name":"host","data_type":"String"},{"name":"cpu","data_type":"Float64"},{"name":"memory","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[["host, \"name",66.6,1024.0,0]],"total_rows":1}
         })).unwrap()
     );
 
@@ -434,6 +437,16 @@ pub async fn test_sql_api(store_type: StorageType) {
     // this is something only json format can show
     assert!(format!("{:?}", output[0]).contains("\\\"param\\\""));
 
+    // test csv format
+    let res = client
+        .get("/v1/sql?format=csv&sql=select cpu,ts,host from demo limit 1")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = &res.text().await;
+    // Must be escaped correctly: 66.6,0,"host, ""name"
+    assert_eq!(body, "66.6,0,\"host, \"\"name\"\n");
+
     // test parse method
     let res = client.get("/v1/sql/parse?sql=desc table t").send().await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -483,7 +496,7 @@ pub async fn test_sql_api(store_type: StorageType) {
 }
 
 pub async fn test_prometheus_promql_api(store_type: StorageType) {
-    let (app, mut guard) = setup_test_http_app_with_frontend(store_type, "sql_api").await;
+    let (app, mut guard) = setup_test_http_app_with_frontend(store_type, "promql_api").await;
     let client = TestClient::new(app).await;
 
     let res = client
@@ -492,7 +505,18 @@ pub async fn test_prometheus_promql_api(store_type: StorageType) {
         .await;
     assert_eq!(res.status(), StatusCode::OK);
 
-    let _body = serde_json::from_str::<GreptimedbV1Response>(&res.text().await).unwrap();
+    let json_text = res.text().await;
+    assert!(serde_json::from_str::<GreptimedbV1Response>(&json_text).is_ok());
+
+    let res = client
+        .get("/v1/promql?query=1&start=0&end=100&step=5s&format=csv")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let csv_body = &res.text().await;
+    assert_eq!("0,1.0\n5000,1.0\n10000,1.0\n15000,1.0\n20000,1.0\n25000,1.0\n30000,1.0\n35000,1.0\n40000,1.0\n45000,1.0\n50000,1.0\n55000,1.0\n60000,1.0\n65000,1.0\n70000,1.0\n75000,1.0\n80000,1.0\n85000,1.0\n90000,1.0\n95000,1.0\n100000,1.0\n", csv_body);
+
     guard.remove_all().await;
 }
 
@@ -591,8 +615,10 @@ pub async fn test_prom_http_api(store_type: StorageType) {
     assert_eq!(body.status, "success");
     assert_eq!(
         body.data,
-        serde_json::from_value::<PrometheusResponse>(json!(["__name__", "host", "idc", "number",]))
-            .unwrap()
+        serde_json::from_value::<PrometheusResponse>(json!([
+            "__name__", "env", "host", "idc", "number",
+        ]))
+        .unwrap()
     );
 
     // labels query with multiple match[] params
@@ -713,6 +739,19 @@ pub async fn test_prom_http_api(store_type: StorageType) {
         serde_json::from_value::<PrometheusResponse>(json!(["idc1"])).unwrap()
     );
 
+    // match labels.
+    let res = client
+        .get("/v1/prometheus/api/v1/label/host/values?match[]=multi_labels{idc=\"idc1\", env=\"dev\"}&start=0&end=600")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
+    assert_eq!(body.status, "success");
+    assert_eq!(
+        body.data,
+        serde_json::from_value::<PrometheusResponse>(json!(["host1", "host2"])).unwrap()
+    );
+
     // search field name
     let res = client
         .get("/v1/prometheus/api/v1/label/__field__/values?match[]=demo")
@@ -802,6 +841,7 @@ pub async fn test_prom_http_api(store_type: StorageType) {
             "demo_metrics_with_nanos".to_string(),
             "logic_table".to_string(),
             "mito".to_string(),
+            "multi_labels".to_string(),
             "numbers".to_string()
         ])
     );
@@ -1054,9 +1094,6 @@ max_log_files = 720
 append_stdout = true
 enable_otlp_tracing = false
 
-[logging.slow_query]
-enable = false
-
 [[region_engine]]
 
 [region_engine.mito]
@@ -1110,7 +1147,15 @@ type = "time_series"
 enable = false
 write_interval = "30s"
 
-[tracing]"#,
+[tracing]
+
+[slow_query]
+enable = true
+record_type = "system_table"
+threshold = "30s"
+sample_ratio = 1.0
+ttl = "30d"
+"#,
     )
     .trim()
     .to_string();
@@ -1142,6 +1187,7 @@ fn drop_lines_with_inconsistent_results(input: String) -> String {
         "selector_result_cache_size =",
         "metadata_cache_size =",
         "content_cache_size =",
+        "result_cache_size =",
         "name =",
         "recovery_parallelism =",
         "max_background_flushes =",
@@ -1211,6 +1257,82 @@ pub async fn test_prometheus_remote_write(store_type: StorageType) {
         .send()
         .await;
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    let expected = "[[\"demo\"],[\"demo_metrics\"],[\"demo_metrics_with_nanos\"],[\"greptime_physical_table\"],[\"metric1\"],[\"metric2\"],[\"metric3\"],[\"mito\"],[\"multi_labels\"],[\"numbers\"],[\"phy\"],[\"phy2\"],[\"phy_ns\"]]";
+    validate_data("prometheus_remote_write", &client, "show tables;", expected).await;
+
+    let table_val = "[[1000,3.0,\"z001\",\"test_host1\"],[2000,4.0,\"z001\",\"test_host1\"]]";
+    validate_data(
+        "prometheus_remote_write",
+        &client,
+        "select * from metric2",
+        table_val,
+    )
+    .await;
+
+    // Write snappy encoded data with new labels
+    let write_request = WriteRequest {
+        timeseries: mock_timeseries_new_label(),
+        ..Default::default()
+    };
+    let serialized_request = write_request.encode_to_vec();
+    let compressed_request =
+        prom_store::snappy_compress(&serialized_request).expect("failed to encode snappy");
+
+    let res = client
+        .post("/v1/prometheus/write")
+        .header("Content-Encoding", "snappy")
+        .body(compressed_request)
+        .send()
+        .await;
+
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    guard.remove_all().await;
+}
+
+pub async fn test_prometheus_remote_write_with_pipeline(store_type: StorageType) {
+    common_telemetry::init_default_ut_logging();
+    let (app, mut guard) =
+        setup_test_prom_app_with_frontend(store_type, "prometheus_remote_write_with_pipeline")
+            .await;
+    let client = TestClient::new(app).await;
+
+    // write snappy encoded data
+    let write_request = WriteRequest {
+        timeseries: prom_store::mock_timeseries(),
+        ..Default::default()
+    };
+    let serialized_request = write_request.encode_to_vec();
+    let compressed_request =
+        prom_store::snappy_compress(&serialized_request).expect("failed to encode snappy");
+
+    let res = client
+        .post("/v1/prometheus/write")
+        .header("Content-Encoding", "snappy")
+        .header("x-greptime-log-pipeline-name", "greptime_identity")
+        .body(compressed_request)
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    let expected = "[[\"demo\"],[\"demo_metrics\"],[\"demo_metrics_with_nanos\"],[\"greptime_physical_table\"],[\"metric1\"],[\"metric2\"],[\"metric3\"],[\"mito\"],[\"multi_labels\"],[\"numbers\"],[\"phy\"],[\"phy2\"],[\"phy_ns\"]]";
+    validate_data(
+        "prometheus_remote_write_pipeline",
+        &client,
+        "show tables;",
+        expected,
+    )
+    .await;
+
+    let table_val = "[[1000,3.0,\"z001\",\"test_host1\"],[2000,4.0,\"z001\",\"test_host1\"]]";
+    validate_data(
+        "prometheus_remote_write_pipeline",
+        &client,
+        "select * from metric2",
+        table_val,
+    )
+    .await;
 
     guard.remove_all().await;
 }
@@ -2102,7 +2224,7 @@ transform:
                 "data_type": "STRING",
                 "key": "log",
                 "semantic_type": "FIELD",
-                "value": "ClusterAdapter:enter sendTextDataToCluster\\n"
+                "value": "ClusterAdapter:enter sendTextDataToCluster"
             },
             {
                 "data_type": "STRING",
@@ -2116,6 +2238,44 @@ transform:
                 "semantic_type": "TIMESTAMP",
                 "value": "2024-05-25 20:16:37.217+0000"
             }
+        ],
+        [
+            {
+                "data_type": "INT32",
+                "key": "id1",
+                "semantic_type": "FIELD",
+                "value": 1111
+            },
+            {
+                "data_type": "INT32",
+                "key": "id2",
+                "semantic_type": "FIELD",
+                "value": 2222
+            },
+            {
+                "data_type": "STRING",
+                "key": "type",
+                "semantic_type": "FIELD",
+                "value": "D"
+            },
+            {
+                "data_type": "STRING",
+                "key": "log",
+                "semantic_type": "FIELD",
+                "value": "ClusterAdapter:enter sendTextDataToCluster ggg"
+            },
+            {
+                "data_type": "STRING",
+                "key": "logger",
+                "semantic_type": "FIELD",
+                "value": "INTERACT.MANAGER"
+            },
+            {
+                "data_type": "TIMESTAMP_NANOSECOND",
+                "key": "time",
+                "semantic_type": "TIMESTAMP",
+                "value": "2024-05-25 20:16:38.217+0000"
+            }
         ]
     ]);
     {
@@ -2128,7 +2288,15 @@ transform:
             "logger": "INTERACT.MANAGER",
             "type": "I",
             "time": "2024-05-25 20:16:37.217",
-            "log": "ClusterAdapter:enter sendTextDataToCluster\\n"
+            "log": "ClusterAdapter:enter sendTextDataToCluster"
+          },
+         {
+            "id1": "1111",
+            "id2": "2222",
+            "logger": "INTERACT.MANAGER",
+            "type": "D",
+            "time": "2024-05-25 20:16:38.217",
+            "log": "ClusterAdapter:enter sendTextDataToCluster ggg"
           }
         ]
         "#;
@@ -2147,25 +2315,29 @@ transform:
     }
     {
         // test new api specify pipeline via pipeline_name
-        let body = r#"
-            {
-            "pipeline_name": "test",
-            "data": [
+        let data = r#"[
                 {
                 "id1": "2436",
                 "id2": "2528",
                 "logger": "INTERACT.MANAGER",
                 "type": "I",
                 "time": "2024-05-25 20:16:37.217",
-                "log": "ClusterAdapter:enter sendTextDataToCluster\\n"
+                "log": "ClusterAdapter:enter sendTextDataToCluster"
+                },
+                {
+                "id1": "1111",
+                "id2": "2222",
+                "logger": "INTERACT.MANAGER",
+                "type": "D",
+                "time": "2024-05-25 20:16:38.217",
+                "log": "ClusterAdapter:enter sendTextDataToCluster ggg"
                 }
-            ]
-            }
-        "#;
+            ]"#;
+        let body = json!({"pipeline_name":"test","data":data});
         let res = client
             .post("/v1/pipelines/_dryrun")
             .header("Content-Type", "application/json")
-            .body(body)
+            .body(body.to_string())
             .send()
             .await;
         assert_eq!(res.status(), StatusCode::OK);
@@ -2176,18 +2348,55 @@ transform:
         assert_eq!(rows, &dryrun_rows);
     }
     {
+        let pipeline_content_for_text = r#"
+processors:
+  - dissect:
+      fields:
+        - message
+      patterns:
+        - "%{id1} %{id2} %{logger} %{type} \"%{time}\" \"%{log}\""
+  - date:
+      field: time
+      formats:
+        - "%Y-%m-%d %H:%M:%S%.3f"
+      ignore_missing: true
+
+transform:
+  - fields:
+      - id1
+      - id2
+    type: int32
+  - fields:
+      - type
+      - log
+      - logger
+    type: string
+  - field: time
+    type: time
+    index: timestamp
+"#;
+
         // test new api specify pipeline via pipeline raw data
-        let mut body = json!({
-        "data": [
+        let data = r#"[
             {
             "id1": "2436",
             "id2": "2528",
             "logger": "INTERACT.MANAGER",
             "type": "I",
             "time": "2024-05-25 20:16:37.217",
-            "log": "ClusterAdapter:enter sendTextDataToCluster\\n"
+            "log": "ClusterAdapter:enter sendTextDataToCluster"
+            },
+            {
+            "id1": "1111",
+            "id2": "2222",
+            "logger": "INTERACT.MANAGER",
+            "type": "D",
+            "time": "2024-05-25 20:16:38.217",
+            "log": "ClusterAdapter:enter sendTextDataToCluster ggg"
             }
-        ]
+        ]"#;
+        let mut body = json!({
+        "data": data
         });
         body["pipeline"] = json!(pipeline_content);
         let res = client
@@ -2198,6 +2407,73 @@ transform:
             .await;
         assert_eq!(res.status(), StatusCode::OK);
         let body: Value = res.json().await;
+        let schema = &body[0]["schema"];
+        let rows = &body[0]["rows"];
+        assert_eq!(schema, &dryrun_schema);
+        assert_eq!(rows, &dryrun_rows);
+        let mut body_for_text = json!({
+            "data": r#"2436 2528 INTERACT.MANAGER I "2024-05-25 20:16:37.217" "ClusterAdapter:enter sendTextDataToCluster"
+1111 2222 INTERACT.MANAGER D "2024-05-25 20:16:38.217" "ClusterAdapter:enter sendTextDataToCluster ggg"
+"#,
+        });
+        body_for_text["pipeline"] = json!(pipeline_content_for_text);
+        body_for_text["data_type"] = json!("text/plain");
+        let ndjson_content = r#"{"id1":"2436","id2":"2528","logger":"INTERACT.MANAGER","type":"I","time":"2024-05-25 20:16:37.217","log":"ClusterAdapter:enter sendTextDataToCluster"}
+{"id1":"1111","id2":"2222","logger":"INTERACT.MANAGER","type":"D","time":"2024-05-25 20:16:38.217","log":"ClusterAdapter:enter sendTextDataToCluster ggg"}
+"#;
+        let body_for_ndjson = json!({
+            "pipeline":pipeline_content,
+            "data_type": "application/x-ndjson",
+            "data": ndjson_content,
+        });
+        let res = client
+            .post("/v1/pipelines/_dryrun")
+            .header("Content-Type", "application/json")
+            .body(body_for_ndjson.to_string())
+            .send()
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: Value = res.json().await;
+        let schema = &body[0]["schema"];
+        let rows = &body[0]["rows"];
+        assert_eq!(schema, &dryrun_schema);
+        assert_eq!(rows, &dryrun_rows);
+
+        body_for_text["data_type"] = json!("application/yaml");
+        let res = client
+            .post("/v1/pipelines/_dryrun")
+            .header("Content-Type", "application/json")
+            .body(body_for_text.to_string())
+            .send()
+            .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body: Value = res.json().await;
+        assert_eq!(body["error"], json!("Invalid request parameter: invalid content type: application/yaml, expected: one of application/json, application/x-ndjson, text/plain"));
+
+        body_for_text["data_type"] = json!("application/json");
+        let res = client
+            .post("/v1/pipelines/_dryrun")
+            .header("Content-Type", "application/json")
+            .body(body_for_text.to_string())
+            .send()
+            .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body: Value = res.json().await;
+        assert_eq!(
+            body["error"],
+            json!("Invalid request parameter: json format error, please check the date is valid JSON.")
+        );
+
+        body_for_text["data_type"] = json!("text/plain");
+        let res = client
+            .post("/v1/pipelines/_dryrun")
+            .header("Content-Type", "application/json")
+            .body(body_for_text.to_string())
+            .send()
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: Value = res.json().await;
+
         let schema = &body[0]["schema"];
         let rows = &body[0]["rows"];
         assert_eq!(schema, &dryrun_schema);
@@ -2215,6 +2491,14 @@ transform:
             "type": "I",
             "time": "2024-05-25 20:16:37.217",
             "log": "ClusterAdapter:enter sendTextDataToCluster\\n"
+            },
+            {
+            "id1": "1111",
+            "id2": "2222",
+            "logger": "INTERACT.MANAGER",
+            "type": "D",
+            "time": "2024-05-25 20:16:38.217",
+            "log": "ClusterAdapter:enter sendTextDataToCluster ggg"
             }
         ]
         });
@@ -2313,6 +2597,250 @@ transform:
         v,
         r#"[["hello",1716668197217000000],["hello world",1716668197218000000]]"#,
     );
+
+    guard.remove_all().await;
+}
+
+pub async fn test_pipeline_auto_transform(store_type: StorageType) {
+    common_telemetry::init_default_ut_logging();
+    let (app, mut guard) =
+        setup_test_http_app_with_frontend(store_type, "test_pipeline_auto_transform").await;
+
+    // handshake
+    let client = TestClient::new(app).await;
+
+    let body = r#"
+processors:
+  - dissect:
+      fields:
+        - message
+      patterns:
+        - "%{+ts} %{+ts} %{http_status_code} %{content}"
+  - date:
+      fields:
+        - ts
+      formats:
+        - "%Y-%m-%d %H:%M:%S%.3f"
+"#;
+
+    // 1. create pipeline
+    let res = client
+        .post("/v1/pipelines/test")
+        .header("Content-Type", "application/x-yaml")
+        .body(body)
+        .send()
+        .await;
+
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 2. write data
+    let data_body = r#"
+2024-05-25 20:16:37.217 404 hello
+2024-05-25 20:16:37.218 200 hello world
+"#;
+    let res = client
+        .post("/v1/ingest?db=public&table=logs1&pipeline_name=test")
+        .header("Content-Type", "text/plain")
+        .body(data_body)
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 3. select data
+    let expected = "[[1716668197217000000,\"hello\",\"404\",\"2024-05-25 20:16:37.217 404 hello\"],[1716668197218000000,\"hello world\",\"200\",\"2024-05-25 20:16:37.218 200 hello world\"]]";
+    validate_data(
+        "test_pipeline_auto_transform",
+        &client,
+        "select * from logs1",
+        expected,
+    )
+    .await;
+
+    guard.remove_all().await;
+}
+
+pub async fn test_pipeline_auto_transform_with_select(store_type: StorageType) {
+    common_telemetry::init_default_ut_logging();
+    let (app, mut guard) =
+        setup_test_http_app_with_frontend(store_type, "test_pipeline_auto_transform_with_select")
+            .await;
+
+    // handshake
+    let client = TestClient::new(app).await;
+    let data_body = r#"
+2024-05-25 20:16:37.217 404 hello
+2024-05-25 20:16:37.218 200 hello world"#;
+
+    // select include
+    {
+        let body = r#"
+        processors:
+          - dissect:
+              fields:
+                - message
+              patterns:
+                - "%{+ts} %{+ts} %{http_status_code} %{content}"
+          - date:
+              fields:
+                - ts
+              formats:
+                - "%Y-%m-%d %H:%M:%S%.3f"
+          - select:
+              fields:
+                - ts
+                - http_status_code
+        "#;
+
+        // 1. create pipeline
+        let res = client
+            .post("/v1/pipelines/test")
+            .header("Content-Type", "application/x-yaml")
+            .body(body)
+            .send()
+            .await;
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // 2. write data
+        let res = client
+            .post("/v1/ingest?db=public&table=logs1&pipeline_name=test")
+            .header("Content-Type", "text/plain")
+            .body(data_body)
+            .send()
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // 3. select data
+        let expected = "[[1716668197217000000,\"404\"],[1716668197218000000,\"200\"]]";
+        validate_data(
+            "test_pipeline_auto_transform_with_select",
+            &client,
+            "select * from logs1",
+            expected,
+        )
+        .await;
+    }
+
+    // select include rename
+    {
+        let body = r#"
+        processors:
+          - dissect:
+              fields:
+                - message
+              patterns:
+                - "%{+ts} %{+ts} %{http_status_code} %{content}"
+          - date:
+              fields:
+                - ts
+              formats:
+                - "%Y-%m-%d %H:%M:%S%.3f"
+          - select:
+              fields:
+                - ts
+                - key: http_status_code
+                  rename_to: s_code
+        "#;
+
+        // 1. create pipeline
+        let res = client
+            .post("/v1/pipelines/test2")
+            .header("Content-Type", "application/x-yaml")
+            .body(body)
+            .send()
+            .await;
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // 2. write data
+        let res = client
+            .post("/v1/ingest?db=public&table=logs2&pipeline_name=test2")
+            .header("Content-Type", "text/plain")
+            .body(data_body)
+            .send()
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // 3. check schema
+        let expected = "[[\"ts\",\"TimestampNanosecond\",\"PRI\",\"NO\",\"\",\"TIMESTAMP\"],[\"s_code\",\"String\",\"\",\"YES\",\"\",\"FIELD\"]]";
+        validate_data(
+            "test_pipeline_auto_transform_with_select_rename",
+            &client,
+            "desc table logs2",
+            expected,
+        )
+        .await;
+
+        // 4. check data
+        let expected = "[[1716668197217000000,\"404\"],[1716668197218000000,\"200\"]]";
+        validate_data(
+            "test_pipeline_auto_transform_with_select_rename",
+            &client,
+            "select * from logs2",
+            expected,
+        )
+        .await;
+    }
+
+    // select exclude
+    {
+        let body = r#"
+            processors:
+              - dissect:
+                  fields:
+                    - message
+                  patterns:
+                    - "%{+ts} %{+ts} %{http_status_code} %{content}"
+              - date:
+                  fields:
+                    - ts
+                  formats:
+                    - "%Y-%m-%d %H:%M:%S%.3f"
+              - select:
+                  type: exclude
+                  fields:
+                    - http_status_code
+            "#;
+
+        // 1. create pipeline
+        let res = client
+            .post("/v1/pipelines/test3")
+            .header("Content-Type", "application/x-yaml")
+            .body(body)
+            .send()
+            .await;
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // 2. write data
+        let res = client
+            .post("/v1/ingest?db=public&table=logs3&pipeline_name=test3")
+            .header("Content-Type", "text/plain")
+            .body(data_body)
+            .send()
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // 3. check schema
+        let expected = "[[\"ts\",\"TimestampNanosecond\",\"PRI\",\"NO\",\"\",\"TIMESTAMP\"],[\"content\",\"String\",\"\",\"YES\",\"\",\"FIELD\"],[\"message\",\"String\",\"\",\"YES\",\"\",\"FIELD\"]]";
+        validate_data(
+            "test_pipeline_auto_transform_with_select_rename",
+            &client,
+            "desc table logs3",
+            expected,
+        )
+        .await;
+
+        // 4. check data
+        let expected = "[[1716668197217000000,\"hello\",\"2024-05-25 20:16:37.217 404 hello\"],[1716668197218000000,\"hello world\",\"2024-05-25 20:16:37.218 200 hello world\"]]";
+        validate_data(
+            "test_pipeline_auto_transform_with_select_rename",
+            &client,
+            "select * from logs3",
+            expected,
+        )
+        .await;
+    }
 
     guard.remove_all().await;
 }
@@ -2555,7 +3083,7 @@ pub async fn test_otlp_traces_v1(store_type: StorageType) {
     )
     .await;
 
-    let expected_ddl = r#"[["mytable_services","CREATE TABLE IF NOT EXISTS \"mytable_services\" (\n  \"timestamp\" TIMESTAMP(9) NOT NULL,\n  \"service_name\" STRING NULL,\n  TIME INDEX (\"timestamp\")\n)\n\nENGINE=mito\nWITH(\n  append_mode = 'true'\n)"]]"#;
+    let expected_ddl = r#"[["mytable_services","CREATE TABLE IF NOT EXISTS \"mytable_services\" (\n  \"timestamp\" TIMESTAMP(9) NOT NULL,\n  \"service_name\" STRING NULL,\n  TIME INDEX (\"timestamp\"),\n  PRIMARY KEY (\"service_name\")\n)\n\nENGINE=mito\nWITH(\n  append_mode = 'false'\n)"]]"#;
     validate_data(
         "otlp_traces",
         &client,
